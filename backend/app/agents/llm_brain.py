@@ -73,7 +73,7 @@ class LLMBrain(AgentBrain):
             confidence = float(data["confidence"])
         except (TypeError, ValueError) as exc:
             raise LLMResponseError("Evaluation confidence is not a number") from exc
-        if 1.0 < confidence <= 100.0:  # model answered as a percentage
+        if 10.0 < confidence <= 100.0:  # model answered as a percentage
             confidence /= 100.0
         confidence = max(0.0, min(1.0, confidence))
         ok = bool(data.get("ok", confidence >= 0.4))

@@ -15,8 +15,9 @@ from sqlalchemy.orm import sessionmaker
 from app.agents.runner import agent_runner
 from app.db.base import Base
 from app.db.session import get_db
-from app.main import app
 import app.models  # noqa: F401
+from app.main import app
+
 
 
 @pytest.fixture()
