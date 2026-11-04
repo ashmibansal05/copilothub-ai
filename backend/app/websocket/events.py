@@ -12,6 +12,12 @@ class EventType(str, enum.Enum):
     AGENT_MESSAGE = "AGENT_MESSAGE"
     PAUSED = "PAUSED"
     RESUMED = "RESUMED"
+    STEP_STARTED = "STEP_STARTED"
+    STEP_COMPLETED = "STEP_COMPLETED"
+    TOOL_STARTED = "TOOL_STARTED"
+    TOOL_COMPLETED = "TOOL_COMPLETED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
     # Ephemeral connection / presence events (not stored)
     CONNECTED = "CONNECTED"
     PONG = "PONG"

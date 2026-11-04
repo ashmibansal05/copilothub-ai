@@ -1,5 +1,6 @@
 import { api } from "./api";
 import type {
+  AgentState,
   ControlAction,
   InvitePreview,
   SessionDetail,
@@ -21,6 +22,8 @@ export const sessionService = {
   join: (code: string) => api.post<SessionDetail>("/sessions/join", { code }).then((r) => r.data),
 
   events: (id: string) => api.get<SessionEvent[]>(`/sessions/${id}/events`).then((r) => r.data),
+
+  state: (id: string) => api.get<AgentState>(`/sessions/${id}/state`).then((r) => r.data),
 
   control: (id: string, action: ControlAction) =>
     api.post(`/sessions/${id}/${action}`).then((r) => r.data),

@@ -1,5 +1,8 @@
 import {
   Activity,
+  AlertTriangle,
+  CheckCircle2,
+  ListChecks,
   MessageSquare,
   Pause,
   Play,
@@ -7,6 +10,7 @@ import {
   UserMinus,
   UserPlus,
   Users,
+  Wrench,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { SessionEvent } from "../types";
@@ -28,8 +32,29 @@ function describe(e: SessionEvent): Described {
         text: `Status: ${e.payload.previous_status} → ${e.payload.status}`,
         color: "text-sky-600",
       };
+    case "STEP_STARTED":
+      return {
+        icon: ListChecks,
+        text:
+          e.payload.phase === "PLAN"
+            ? "Planning the research"
+            : `Step ${e.payload.step_index}/${e.payload.total_steps}: ${e.payload.step}`,
+        color: "text-brand-600",
+      };
+    case "STEP_COMPLETED":
+      return { icon: CheckCircle2, text: String(e.payload.summary ?? "Step completed"), color: "text-emerald-600" };
+    case "TOOL_STARTED":
+      return { icon: Wrench, text: `Calling ${e.payload.tool}`, color: "text-slate-500" };
+    case "TOOL_COMPLETED":
+      return e.payload.success
+        ? { icon: Wrench, text: `${e.payload.tool} finished (${e.payload.duration_ms} ms)`, color: "text-slate-600" }
+        : { icon: AlertTriangle, text: `${e.payload.tool} failed: ${e.payload.error ?? "error"}`, color: "text-red-600" };
     case "AGENT_MESSAGE":
       return { icon: MessageSquare, text: String(e.payload.text ?? ""), color: "text-slate-600" };
+    case "COMPLETED":
+      return { icon: CheckCircle2, text: "Agent completed the task", color: "text-emerald-600" };
+    case "FAILED":
+      return { icon: AlertTriangle, text: `Agent failed: ${e.payload.error ?? "unknown error"}`, color: "text-red-600" };
     case "PAUSED":
       return { icon: Pause, text: `${who} paused the session`, color: "text-amber-600" };
     case "RESUMED":

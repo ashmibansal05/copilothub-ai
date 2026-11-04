@@ -1,13 +1,26 @@
 import { Check, Copy, Eye, Loader2, Pause, Play, Square, Wifi, WifiOff } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import AgentPanel from "../components/AgentPanel";
 import EventTimeline from "../components/EventTimeline";
 import { RoleBadge, StatusBadge } from "../components/StatusBadge";
+import ToolActivity from "../components/ToolActivity";
 import { useSessionSocket } from "../hooks/useSessionSocket";
 import type { ConnectionStatus } from "../hooks/useSessionSocket";
 import { getErrorMessage } from "../services/api";
 import { sessionService } from "../services/sessionService";
-import type { ControlAction, SessionDetail, SessionEvent } from "../types";
+import type { AgentState, ControlAction, SessionDetail, SessionEvent } from "../types";
+import { applyAgentEvent, emptyAgentState } from "../utils/agentState";
+
+// Events that have their own panels; keeping them out of the timeline avoids noise.
+const HIDDEN_IN_TIMELINE = new Set(["TOOL_STARTED", "STEP_COMPLETED", "AGENT_MESSAGE"]);
+
+const MESSAGE_STYLES: Record<string, string> = {
+  agent: "bg-slate-50 text-slate-800",
+  system: "bg-slate-50 text-slate-500",
+  warning: "bg-amber-50 text-amber-800",
+  escalation: "bg-red-50 text-red-800",
+};
 
 function ConnectionBadge({ status }: { status: ConnectionStatus }) {
   if (status === "connected")
@@ -52,6 +65,7 @@ function CopyRow({ label, value }: { label: string; value: string }) {
 export default function SessionWorkspace() {
   const { id } = useParams<{ id: string }>();
   const [session, setSession] = useState<SessionDetail | null>(null);
+  const [agent, setAgent] = useState<AgentState | null>(null);
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -80,6 +94,7 @@ export default function SessionWorkspace() {
     if (!id) return;
     loadSession();
     sessionService.events(id).then(mergeEvents).catch(() => undefined);
+    sessionService.state(id).then(setAgent).catch(() => undefined);
   }, [id, loadSession, mergeEvents]);
 
   const handleEvent = useCallback(
@@ -92,6 +107,7 @@ export default function SessionWorkspace() {
         setSession((s) => (s ? { ...s, status: e.payload.status } : s));
       }
       if (e.type === "MEMBER_JOINED") loadSession();
+      setAgent((prev) => (prev ? applyAgentEvent(prev, e) : prev));
       mergeEvents([e]);
     },
     [loadSession, mergeEvents]
@@ -131,12 +147,14 @@ export default function SessionWorkspace() {
 
   const role = session.my_role;
   const status = session.status;
+  const agentState = agent ?? emptyAgentState(session.id, session.task, status);
   const canStart = role === "OWNER" && status === "CREATED";
-  const canPause = role !== "VIEWER" && status === "RUNNING";
+  const canPause = role !== "VIEWER" && (status === "RUNNING" || status === "PLANNING");
   const canResume = role !== "VIEWER" && status === "PAUSED";
-  const canStop = role === "OWNER" && ["CREATED", "RUNNING", "PAUSED"].includes(status);
+  const canStop = role === "OWNER" && ["CREATED", "RUNNING", "PLANNING", "PAUSED"].includes(status);
   const onlineIds = new Set(online.map((u) => u.user_id));
   const agentMessages = events.filter((e) => e.type === "AGENT_MESSAGE");
+  const timelineEvents = events.filter((e) => !HIDDEN_IN_TIMELINE.has(e.type));
   const origin = window.location.origin;
 
   return (
@@ -158,30 +176,38 @@ export default function SessionWorkspace() {
         {/* Left: timeline */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
           <h2 className="mb-3 font-semibold">Activity timeline</h2>
-          <div className="max-h-[480px] overflow-y-auto pr-1">
-            <EventTimeline events={events} />
+          <div className="max-h-[640px] overflow-y-auto pr-1">
+            <EventTimeline events={timelineEvents} />
           </div>
         </aside>
 
-        {/* Center: task + messages */}
-        <section className="space-y-4">
+        {/* Center: task, agent, tools, messages */}
+        <section className="min-w-0 space-y-4">
           <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="font-semibold">Current task</h2>
             <p className="mt-2 text-sm text-slate-700">{session.task}</p>
-            <p className="mt-4 text-xs text-slate-500">
-              Agent progress, steps and tool activity will appear here once the agent engine is added (Phase 5).
-            </p>
           </div>
+
+          <AgentPanel agent={agentState} status={status} />
+          <ToolActivity events={events} />
 
           <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="mb-3 font-semibold">Agent messages</h2>
             {agentMessages.length === 0 ? (
               <p className="text-sm text-slate-500">Nothing yet. Messages appear here in real time.</p>
             ) : (
-              <ul className="space-y-2">
+              <ul className="max-h-96 space-y-2 overflow-y-auto pr-1">
                 {agentMessages.map((m) => (
-                  <li key={m.id} className="rounded-lg bg-slate-50 px-3 py-2 text-sm">
+                  <li
+                    key={m.id}
+                    className={`whitespace-pre-wrap break-words rounded-lg px-3 py-2 text-sm ${
+                      MESSAGE_STYLES[String(m.payload.kind)] ?? MESSAGE_STYLES.system
+                    }`}
+                  >
                     {String(m.payload.text)}
+                    {m.payload.simulated && (
+                      <span className="ml-2 text-[10px] font-semibold uppercase text-amber-700">simulated</span>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -234,7 +260,7 @@ export default function SessionWorkspace() {
           )}
           {canStart && (
             <button className="btn-primary" disabled={busy !== null} onClick={() => run("start")}>
-              <Play className="h-4 w-4" /> Start
+              <Play className="h-4 w-4" /> Start agent
             </button>
           )}
           {canPause && (

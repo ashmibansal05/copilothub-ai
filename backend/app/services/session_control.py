@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.agents.runner import agent_runner
 from app.api.deps import SessionContext
 from app.models.session import AgentStatus
 from app.schemas.session import StateResponse
@@ -15,12 +16,17 @@ TRANSITIONS: dict[str, tuple[set[AgentStatus], AgentStatus, EventType | None, st
         {AgentStatus.CREATED},
         AgentStatus.RUNNING,
         EventType.AGENT_STARTED,
-        "Session started by {user}. The agent engine is connected in Phase 5.",
+        "Session started by {user}.",
     ),
-    "pause": ({AgentStatus.RUNNING}, AgentStatus.PAUSED, EventType.PAUSED, "Paused by {user}."),
+    "pause": (
+        {AgentStatus.RUNNING, AgentStatus.PLANNING},
+        AgentStatus.PAUSED,
+        EventType.PAUSED,
+        "Paused by {user}. The agent stops after its current step.",
+    ),
     "resume": ({AgentStatus.PAUSED}, AgentStatus.RUNNING, EventType.RESUMED, "Resumed by {user}."),
     "stop": (
-        {AgentStatus.CREATED, AgentStatus.RUNNING, AgentStatus.PAUSED},
+        {AgentStatus.CREATED, AgentStatus.RUNNING, AgentStatus.PLANNING, AgentStatus.PAUSED},
         AgentStatus.CANCELLED,
         None,
         "Stopped by {user}.",
@@ -47,6 +53,14 @@ async def apply_transition(action: str, ctx: SessionContext, db: Session) -> Sta
         session.ended_at = now
     db.commit()
 
+    # Tell the agent runner right after the DB change.
+    if action == "pause":
+        agent_runner.pause(session_id)
+    elif action == "resume":
+        agent_runner.resume(session_id)
+    elif action == "stop":
+        await agent_runner.stop(session_id)
+
     user = ctx.user
     if event_type is not None:
         await event_service.publish(db, session_id, event_type, {}, user)
@@ -64,4 +78,8 @@ async def apply_transition(action: str, ctx: SessionContext, db: Session) -> Sta
         {"kind": "system", "text": template.format(user=user.username)},
         user,
     )
+
+    if action == "start":
+        await agent_runner.start(session_id)
+
     return StateResponse(session_id=session_id, status=target, previous_status=previous)

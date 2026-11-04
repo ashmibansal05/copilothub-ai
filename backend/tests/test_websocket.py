@@ -3,6 +3,9 @@ from helpers import create_session, join, make_user
 from starlette.websockets import WebSocketDisconnect
 
 
+pytestmark = pytest.mark.usefixtures("disable_agent")
+
+
 def open_ws(client, session_id):
     return client.websocket_connect(f"/ws/sessions/{session_id}")
 

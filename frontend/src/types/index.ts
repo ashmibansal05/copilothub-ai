@@ -98,3 +98,22 @@ export interface OnlineUser {
   username: string;
   role: UserRole;
 }
+// ---------- Agent (Phase 5) ----------
+
+export interface AgentState {
+  session_id: string;
+  status: AgentStatus;
+  current_task: string;
+  current_step: string | null;
+  step_index: number; // steps completed so far
+  total_steps: number;
+  progress: number;
+  confidence: number | null;
+  engine: string | null;
+  plan: string[];
+  recent_actions: Record<string, unknown>[];
+  tool_results: Record<string, unknown>[];
+  active_constraints: unknown[];
+  human_interventions: unknown[];
+  pending_approval: unknown | null;
+}

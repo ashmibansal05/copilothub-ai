@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.logging import setup_logging
+from app.services.agent_service import recover_orphaned_sessions
 from app.websocket.routes import router as ws_router
 
 settings = get_settings()
@@ -17,11 +18,16 @@ logger = logging.getLogger("copilothub")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logger.info(
-        "Starting %s (env=%s, demo_mode=%s)",
+        "Starting %s (env=%s, demo_mode=%s, llm=%s)",
         settings.app_name,
         settings.environment,
         settings.demo_mode,
+        settings.llm_provider,
     )
+    try:
+        await recover_orphaned_sessions()
+    except Exception:
+        logger.exception("Could not check for interrupted sessions (is the database migrated?)")
     yield
     logger.info("Shutting down")
 
@@ -29,7 +35,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     description="Collaborative human-in-the-loop platform for controlling AI agents",
-    version="0.4.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
