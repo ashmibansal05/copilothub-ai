@@ -1,4 +1,5 @@
 import uuid
+from dataclasses import dataclass
 
 import jwt
 from fastapi import Depends, HTTPException, status
@@ -7,7 +8,9 @@ from sqlalchemy.orm import Session
 
 from app.core.security import decode_access_token
 from app.db.session import get_db
+from app.models.session import AgentSession, SessionMember
 from app.models.user import User, UserRole
+from app.services import session_service
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -41,8 +44,7 @@ def get_current_user(
 
 
 def require_roles(*allowed: UserRole):
-    """Dependency factory. Roles are read from the DB user, never from the client.
-    Phase 3+ will add per-session role checks on top of this."""
+    """Account-level role check (kept from Phase 2)."""
 
     def checker(user: User = Depends(get_current_user)) -> User:
         if user.role not in allowed:
@@ -51,5 +53,48 @@ def require_roles(*allowed: UserRole):
                 detail="You do not have permission to perform this action",
             )
         return user
+
+    return checker
+
+
+# ---------- Per-session authorization (Phase 3) ----------
+
+
+@dataclass
+class SessionContext:
+    session: AgentSession
+    member: SessionMember
+    user: User
+
+    @property
+    def role(self) -> UserRole:
+        return self.member.role
+
+
+def get_session_context(
+    session_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SessionContext:
+    """Loads the session and the caller's membership. Non-members get 404 so
+    session IDs cannot be probed."""
+    session = db.get(AgentSession, session_id)
+    member = session_service.get_membership(db, session_id, user.id) if session else None
+    if session is None or member is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+    return SessionContext(session=session, member=member, user=user)
+
+
+def require_session_role(*allowed: UserRole):
+    """Dependency factory: caller must hold one of `allowed` roles IN THIS SESSION.
+    The role always comes from the database, never from the client."""
+
+    def checker(ctx: SessionContext = Depends(get_session_context)) -> SessionContext:
+        if ctx.role not in allowed:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"Your role ({ctx.role.value}) is not allowed to do this",
+            )
+        return ctx
 
     return checker

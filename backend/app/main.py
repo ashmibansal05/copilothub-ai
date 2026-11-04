@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.logging import setup_logging
+from app.websocket.routes import router as ws_router
 
 settings = get_settings()
 setup_logging(settings.debug)
@@ -28,7 +29,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     description="Collaborative human-in-the-loop platform for controlling AI agents",
-    version="0.2.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -41,3 +42,4 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+app.include_router(ws_router)
