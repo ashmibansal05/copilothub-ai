@@ -2,7 +2,10 @@ import { api } from "./api";
 import type {
   AgentState,
   ControlAction,
+  Intervention,
+  InterventionPayload,
   InvitePreview,
+  MemoryView,
   SessionDetail,
   SessionEvent,
   SessionSummary,
@@ -27,4 +30,15 @@ export const sessionService = {
 
   control: (id: string, action: ControlAction) =>
     api.post(`/sessions/${id}/${action}`).then((r) => r.data),
+
+  interventions: (id: string) =>
+    api.get<Intervention[]>(`/sessions/${id}/interventions`).then((r) => r.data),
+
+  intervene: (id: string, payload: InterventionPayload) =>
+    api.post<Intervention>(`/sessions/${id}/interventions`, payload).then((r) => r.data),
+
+  removeConstraint: (id: string, constraintId: string) =>
+    api.delete(`/sessions/${id}/constraints/${constraintId}`).then((r) => r.data),
+
+  memory: (id: string) => api.get<MemoryView>(`/sessions/${id}/memory`).then((r) => r.data),
 };

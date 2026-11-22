@@ -6,6 +6,7 @@ os.environ["SECRET_KEY"] = "test-secret-key-test-secret-key-1234567890"
 os.environ["DEMO_MODE"] = "true"
 os.environ["AGENT_STEP_DELAY_SECONDS"] = "0"
 os.environ["AGENT_RETRY_BACKOFF_SECONDS"] = "0"
+os.environ["AGENT_REQUIRE_FINAL_APPROVAL"] = "false"  # tests turn it on where needed
 
 import pytest
 from fastapi.testclient import TestClient
@@ -60,3 +61,11 @@ def disable_agent(monkeypatch):
         return False
 
     monkeypatch.setattr(agent_runner, "start", _noop)
+@pytest.fixture()
+def set_brain(monkeypatch):
+    """Replace the agent's brain for the duration of one test."""
+
+    def _set(brain):
+        monkeypatch.setattr(agent_runner, "brain_factory", brain.factory())
+
+    return _set

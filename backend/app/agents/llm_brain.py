@@ -34,8 +34,10 @@ class LLMBrain(AgentBrain):
         self.engine = f"{provider.name}:{provider.model}"
         self.description = f"{provider.name} / {provider.model} (model knowledge only, no retrieval yet)"
 
-    async def make_plan(self, task: str, constraints: list[str], max_steps: int) -> list[str]:
-        messages = build_messages(task, PLAN_INSTRUCTION.format(max_steps=max_steps), constraints)
+    async def make_plan(self, task, constraints, max_steps, notes=None) -> list[str]:
+        messages = build_messages(
+            task, PLAN_INSTRUCTION.format(max_steps=max_steps), constraints, human_notes=notes
+        )
         raw = await self.provider.generate(messages, json_mode=True, max_tokens=500)
         data = extract_json(raw)
         steps = data.get("steps") if isinstance(data, dict) else data
@@ -49,12 +51,13 @@ class LLMBrain(AgentBrain):
     def tool_for_step(self, step: str) -> str:
         return "llm_reasoning"
 
-    async def execute_step(self, task, step, history, constraints) -> StepResult:
+    async def execute_step(self, task, step, history, constraints, notes=None) -> StepResult:
         messages = build_messages(
             task,
             EXECUTE_INSTRUCTION.format(step=fence(step)),
             constraints,
             tool_results=_history_snippets(history),
+            human_notes=notes,
         )
         text = await self.provider.generate(messages, max_tokens=400)
         return StepResult(tool="llm_reasoning", output=text, simulated=False, input={"step": step})
@@ -79,6 +82,9 @@ class LLMBrain(AgentBrain):
         ok = bool(data.get("ok", confidence >= 0.4))
         return Evaluation(confidence=round(confidence, 2), ok=ok, note=str(data.get("note", ""))[:200])
 
-    async def summarize(self, task, history) -> str:
-        messages = build_messages(task, SUMMARY_INSTRUCTION, tool_results=_history_snippets(history, limit=12))
+    async def summarize(self, task, history, constraints=None, notes=None) -> str:
+        messages = build_messages(
+            task, SUMMARY_INSTRUCTION, constraints,
+            tool_results=_history_snippets(history, limit=12), human_notes=notes,
+        )
         return await self.provider.generate(messages, max_tokens=500)

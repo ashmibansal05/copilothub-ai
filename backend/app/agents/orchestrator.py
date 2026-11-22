@@ -10,25 +10,30 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 
 from app.agents.brain import AgentBrain, StepResult
-from app.agents.state import AgentGraphState
+from app.agents.state import AgentGraphState, ApprovalDecision, HumanContext
 from app.core.config import Settings, get_settings
 from app.db import session as db_session
 from app.models.agent import AgentAction, AgentState
+from app.models.approval import Approval, ApprovalKind, ApprovalStatus
 from app.models.session import AgentSession, AgentStatus
-from app.services import event_service
+from app.services import approval_service, event_service
+from app.services.constraint_manager import ConstraintManager, ConstraintView
+from app.services.memory_manager import MemoryManager
 from app.websocket.events import EventType
 
 logger = logging.getLogger("copilothub.agent")
 
 BrainFactory = Callable[[], Awaitable[tuple[AgentBrain, str | None]]]
 
-FINISHABLE = {AgentStatus.RUNNING, AgentStatus.PLANNING, AgentStatus.PAUSED}
+FINISHABLE = {
+    AgentStatus.RUNNING, AgentStatus.PLANNING, AgentStatus.PAUSED, AgentStatus.WAITING_FOR_APPROVAL,
+}
 TERMINAL = {AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.CANCELLED}
 PLAN_DONE_PROGRESS = 10
 
 
 class AgentStepError(Exception):
-    """A node failed after exhausting its retries."""
+    """A node failed after exhausting its retries (or a human rejected too often)."""
 
 
 class AgentLimitError(Exception):
@@ -38,8 +43,11 @@ class AgentLimitError(Exception):
 class AgentOrchestrator:
     """Runs one session's agent as a LangGraph workflow:
 
-        plan -> act -> observe -> evaluate -+-> act (next step or retry)
-                                            +-> finalize -> END
+        plan -> act -> observe -> evaluate -+-> act      (next step / retry)
+          ^                                 +-> plan     (task changed: re-plan)
+          |                                 +-> finalize -+-> END (approved)
+          +---------------------------------------------+-> plan (task changed)
+                                                         +-> finalize (draft rejected: revise)
     """
 
     def __init__(
@@ -56,6 +64,12 @@ class AgentOrchestrator:
         self.resume_event.set()  # set = running, cleared = paused
         self._started = time.monotonic()
         self._paused_total = 0.0
+        # human input that arrives while the agent is busy
+        self._review_request: tuple[uuid.UUID | None, str, str | None] | None = None
+        self._replan_requested = False
+        self._replans = 0
+        self._approval_future: asyncio.Future[ApprovalDecision] | None = None
+        self._pending_approval_id: uuid.UUID | None = None
         self.graph = self._build_graph()
 
     # ------------------------------------------------------------------ control
@@ -64,6 +78,19 @@ class AgentOrchestrator:
 
     def resume(self) -> None:
         self.resume_event.set()
+
+    def request_review(self, user_id: uuid.UUID | None, username: str, note: str | None) -> None:
+        self._review_request = (user_id, username, note)
+
+    def request_replan(self) -> None:
+        self._replan_requested = True
+
+    def resolve_approval(self, approval_id: uuid.UUID, decision: ApprovalDecision) -> bool:
+        future = self._approval_future
+        if future is None or future.done() or self._pending_approval_id != approval_id:
+            return False
+        future.set_result(decision)
+        return True
 
     async def checkpoint(self) -> None:
         """Called before every node: waits while paused, enforces the runtime budget."""
@@ -90,14 +117,28 @@ class AgentOrchestrator:
         g.add_edge("act", "observe")
         g.add_edge("observe", "evaluate")
         g.add_conditional_edges(
-            "evaluate", self.route_after_evaluate, {"act": "act", "finalize": "finalize"}
+            "evaluate", self.route_after_evaluate,
+            {"act": "act", "plan": "plan", "finalize": "finalize"},
         )
-        g.add_edge("finalize", END)
+        g.add_conditional_edges(
+            "finalize", self.route_after_finalize,
+            {"plan": "plan", "finalize": "finalize", "end": END},
+        )
         return g.compile()
 
     @staticmethod
     def route_after_evaluate(state: AgentGraphState) -> str:
-        return "finalize" if state.get("decision") == "complete" else "act"
+        decision = state.get("decision")
+        if decision == "replan":
+            return "plan"
+        return "finalize" if decision == "complete" else "act"
+
+    @staticmethod
+    def route_after_finalize(state: AgentGraphState) -> str:
+        decision = state.get("decision")
+        if decision == "replan":
+            return "plan"
+        return "finalize" if decision == "revise" else "end"
 
     async def run(self) -> None:
         """Entry point used by the runner. Never raises except on cancellation."""
@@ -118,9 +159,10 @@ class AgentOrchestrator:
 
             initial: AgentGraphState = {
                 "task": task, "plan": [], "step_index": 0, "steps_executed": 0,
-                "retries": 0, "observations": [],
+                "retries": 0, "observations": [], "approval_round": 0,
             }
-            limit = 3 * self.settings.agent_max_steps + 10  # LangGraph counts every node visit
+            # LangGraph counts every node visit; leave room for re-plans and revisions.
+            limit = 3 * self.settings.agent_max_steps + 60
             final = await self.graph.ainvoke(initial, config={"recursion_limit": limit})
             await self._complete(final)
         except asyncio.CancelledError:
@@ -134,15 +176,21 @@ class AgentOrchestrator:
     async def plan_node(self, state: AgentGraphState) -> dict[str, Any]:
         await self.checkpoint()
         assert self.brain is not None
+        replanning = bool(state.get("plan"))
+        self._replan_requested = False  # a fresh plan reflects the latest task
+        task = self._load_task() if replanning else state["task"]
+        ctx = await self._human_context(task)
+
         await self._set_status(AgentStatus.PLANNING, {AgentStatus.RUNNING})
         await self._emit(EventType.STEP_STARTED, {
-            "phase": "PLAN", "step_index": 0, "total_steps": 0, "step": "Planning the research",
+            "phase": "PLAN", "step_index": 0, "total_steps": 0,
+            "step": "Re-planning after a task change" if replanning else "Planning the research",
             "progress": 0, "engine": self.brain.engine,
         })
         started = time.monotonic()
         plan = await self._attempt(
             "PLAN",
-            lambda: self.brain.make_plan(state["task"], self._constraints(), self.settings.agent_max_steps),
+            lambda: self.brain.make_plan(task, ctx.constraints, self.settings.agent_max_steps, notes=ctx.notes),
         )
         plan = plan[: self.settings.agent_max_steps]
         await self._record_action(0, "PLAN", None, {}, {"plan": plan}, True, None, self._ms(started))
@@ -156,15 +204,20 @@ class AgentOrchestrator:
             "summary": f"Created a {len(plan)}-step plan",
         })
         await self._set_status(AgentStatus.RUNNING, {AgentStatus.PLANNING})
-        return {"plan": plan, "step_index": 0}
+        return {
+            "plan": plan, "step_index": 0, "task": task, "retries": 0,
+            "decision": "continue", "approval_round": 0,
+        }
 
     async def act_node(self, state: AgentGraphState) -> dict[str, Any]:
         await self.checkpoint()
+        await self._maybe_review()
         assert self.brain is not None
         i, plan = state["step_index"], state["plan"]
         n, step = len(plan), plan[i]
         tool = self.brain.tool_for_step(step)
         progress = self._progress(i, n)
+        ctx = await self._human_context(f"{state['task']} {step}")
 
         await self._save_state(current_step=step, progress=progress)
         await self._emit(EventType.STEP_STARTED, {
@@ -178,20 +231,33 @@ class AgentOrchestrator:
         result: StepResult = await self._attempt(
             "ACT",
             lambda: self.brain.execute_step(
-                state["task"], step, state.get("observations", []), self._constraints()
+                state["task"], step, state.get("observations", []), ctx.constraints, notes=ctx.notes
             ),
             step_index=i + 1, tool_name=tool, input_data={"step": step},
         )
+
+        # Enforcement point: whatever the brain returned, the CURRENT human rules decide
+        # which sources the agent may keep.
+        views = await self._active_views()
+        result.sources, result.rejected_sources = ConstraintManager.filter_sources(views, result.sources)
+        if result.rejected_sources:
+            names = sorted({s.get("rejected_by", "?") for s in result.rejected_sources})
+            await self._emit(EventType.AGENT_MESSAGE, {
+                "kind": "constraint",
+                "text": f"Step {i + 1}: filtered {len(result.rejected_sources)} source(s) because of human constraints ({', '.join(names)}).",
+            })
+
         duration = self._ms(started)
         await self._record_action(
             i + 1, "TOOL_CALL", result.tool, {"step": step},
-            {"output": result.output[:2000], "sources": result.sources},
+            {"output": result.output[:2000], "sources": result.sources, "rejected_sources": result.rejected_sources},
             result.success, None, duration,
         )
         await self._emit(EventType.TOOL_COMPLETED, {
             "tool": result.tool, "step_index": i + 1, "success": result.success,
             "duration_ms": duration, "output": result.output[:500],
-            "sources": result.sources, "simulated": result.simulated,
+            "sources": result.sources, "rejected_sources": result.rejected_sources,
+            "simulated": result.simulated,
         })
         return {"last_result": asdict(result), "steps_executed": state.get("steps_executed", 0) + 1}
 
@@ -202,6 +268,7 @@ class AgentOrchestrator:
             "step_index": i + 1, "step": plan[i], "tool": res["tool"],
             "finding": res["output"][:1500], "success": res["success"],
             "simulated": res["simulated"], "sources": res["sources"],
+            "rejected_sources": res["rejected_sources"],
         }
         observations = list(state.get("observations", [])) + [observation]
         await self._emit(EventType.AGENT_MESSAGE, {
@@ -261,6 +328,12 @@ class AgentOrchestrator:
                     "text": f"Step limit ({max_steps}) reached. Remaining plan steps were skipped.",
                 })
 
+        if self._consume_replan():
+            decision, retries = "replan", 0
+            await self._emit(EventType.AGENT_MESSAGE, {
+                "kind": "warning", "text": "A human changed the task. The agent is re-planning.",
+            })
+
         progress = self._progress(next_index, n)
         await self._emit(EventType.STEP_COMPLETED, {
             "phase": "ACT", "step_index": i + 1, "total_steps": n, "step": step,
@@ -273,17 +346,104 @@ class AgentOrchestrator:
     async def finalize_node(self, state: AgentGraphState) -> dict[str, Any]:
         await self.checkpoint()
         assert self.brain is not None
+        if self._consume_replan():
+            return {"decision": "replan", "approved": False}
+
+        ctx = await self._human_context(state["task"])
+        views = await self._active_views()
+        observations, removed = self._refilter(state.get("observations", []), views)
+        if removed:
+            await self._emit(EventType.AGENT_MESSAGE, {
+                "kind": "constraint",
+                "text": f"Removed {removed} previously collected source(s) that violate the current constraints.",
+            })
+
         started = time.monotonic()
         summary = await self._attempt(
-            "FINALIZE", lambda: self.brain.summarize(state["task"], state.get("observations", []))
+            "FINALIZE",
+            lambda: self.brain.summarize(state["task"], observations, ctx.constraints, notes=ctx.notes),
         )
         await self._record_action(
             len(state["plan"]) + 1, "FINALIZE", None, {}, {"summary": summary[:3000]}, True, None, self._ms(started)
         )
+
+        round_no = state.get("approval_round", 0)
         await self._emit(EventType.AGENT_MESSAGE, {
-            "kind": "agent", "simulated": self.brain.simulated, "text": f"Draft summary:\n{summary}",
+            "kind": "agent", "simulated": self.brain.simulated,
+            "text": f"Draft summary (round {round_no + 1}):\n{summary}",
         })
-        return {"summary": summary}
+        if not self.settings.agent_require_final_approval:
+            return {"summary": summary, "approved": True, "decision": "complete"}
+
+        decision = await self.approval_gate(
+            ApprovalKind.FINAL_REPORT, {"draft": summary[:4000], "round": round_no + 1}
+        )
+        if self._consume_replan():  # the task changed while waiting: the decision is void
+            return {"decision": "replan", "approved": False}
+        if decision.approved:
+            await self._emit(EventType.AGENT_MESSAGE, {
+                "kind": "system", "text": f"Final draft approved by {decision.by or 'a reviewer'}.",
+            })
+            return {"summary": summary, "approved": True, "decision": "complete"}
+
+        round_no += 1
+        if round_no >= self.settings.agent_max_approval_rounds:
+            raise AgentStepError(f"The final draft was rejected {round_no} times")
+        await self._emit(EventType.AGENT_MESSAGE, {
+            "kind": "warning",
+            "text": f"Draft rejected by {decision.by or 'a reviewer'}: {decision.note or 'no reason given'}. Revising.",
+        })
+        return {"approval_round": round_no, "approved": False, "decision": "revise"}
+
+    # ------------------------------------------------------------------ approvals
+    async def approval_gate(
+        self, kind: ApprovalKind, payload: dict, requested_by: uuid.UUID | None = None
+    ) -> ApprovalDecision:
+        """Stop and wait for a human decision. The decision arrives through
+        resolve_approval(), called by the intervention API."""
+        with self._db() as db:
+            approval = Approval(
+                session_id=self.session_id, kind=kind, status=ApprovalStatus.PENDING,
+                payload=payload, requested_by=requested_by,
+            )
+            db.add(approval)
+            db.commit()
+            approval_id = approval.id
+
+        future: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
+        self._approval_future, self._pending_approval_id = future, approval_id
+        await self._set_status(AgentStatus.WAITING_FOR_APPROVAL, {AgentStatus.RUNNING, AgentStatus.PLANNING})
+        await self._emit(EventType.APPROVAL_REQUESTED, {
+            "approval_id": str(approval_id), "kind": kind.value, "payload": payload,
+        })
+        await self._emit(EventType.AGENT_MESSAGE, {
+            "kind": "system", "text": "The agent is waiting for human approval.",
+        })
+        try:
+            decision = await future
+        finally:
+            self._approval_future, self._pending_approval_id = None, None
+        await self._set_status(AgentStatus.RUNNING, {AgentStatus.WAITING_FOR_APPROVAL})
+        return decision
+
+    async def _maybe_review(self) -> None:
+        if self._review_request is None:
+            return
+        user_id, username, note = self._review_request
+        self._review_request = None
+        await self.approval_gate(
+            ApprovalKind.REVIEW, {"requested_by": username, "note": note}, requested_by=user_id
+        )
+
+    def _consume_replan(self) -> bool:
+        if not self._replan_requested:
+            return False
+        self._replan_requested = False
+        if self._replans >= self.settings.agent_max_replans:
+            logger.warning("Re-plan limit reached for session %s; ignoring request", self.session_id)
+            return False
+        self._replans += 1
+        return True
 
     # ------------------------------------------------------------------ finishing
     async def _complete(self, final: AgentGraphState) -> None:
@@ -295,6 +455,10 @@ class AgentOrchestrator:
 
     async def _fail(self, error: str) -> None:
         await self._save_state(current_step="Failed")
+        with self._db() as db:
+            expired = approval_service.expire_pending(db, self.session_id)
+        if expired:
+            await self._emit(EventType.APPROVAL_COMPLETED, {"expired": True})
         await self._emit(EventType.AGENT_MESSAGE, {
             "kind": "escalation",
             "text": f"The agent stopped because of an error and needs human attention: {error}",
@@ -303,9 +467,28 @@ class AgentOrchestrator:
             await self._emit(EventType.FAILED, {"error": error})
 
     # ------------------------------------------------------------------ helpers
-    def _constraints(self) -> list[str]:
-        """Active human constraints. Implemented in Phase 8 (always empty for now)."""
-        return []
+    async def _human_context(self, query: str) -> HumanContext:
+        """Active constraints (always) plus the few relevant memory notes (selected)."""
+        with self._db() as db:
+            views = ConstraintManager.to_views(ConstraintManager.active(db, self.session_id))
+            notes = MemoryManager.retrieve(db, self.session_id, query)
+        return HumanContext(constraints=ConstraintManager.prompt_lines(views), notes=notes)
+
+    async def _active_views(self) -> list[ConstraintView]:
+        with self._db() as db:
+            return ConstraintManager.to_views(ConstraintManager.active(db, self.session_id))
+
+    @staticmethod
+    def _refilter(observations: list[dict], views: list[ConstraintView]) -> tuple[list[dict], int]:
+        """Apply today's constraints to everything collected so far (rules may have
+        been added after a source was retrieved)."""
+        removed = 0
+        out = []
+        for obs in observations:
+            allowed, rejected = ConstraintManager.filter_sources(views, obs.get("sources", []))
+            removed += len(rejected)
+            out.append({**obs, "sources": allowed})
+        return out, removed
 
     @staticmethod
     def _ms(started: float) -> int:
@@ -342,6 +525,7 @@ class AgentOrchestrator:
                     await self._emit(EventType.TOOL_COMPLETED, {
                         "tool": tool_name, "step_index": step_index, "success": False,
                         "error": message, "duration_ms": self._ms(started), "sources": [],
+                        "rejected_sources": [],
                         "simulated": bool(self.brain and self.brain.simulated),
                     })
                 else:

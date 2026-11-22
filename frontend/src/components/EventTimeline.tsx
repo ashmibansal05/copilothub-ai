@@ -2,18 +2,23 @@ import {
   Activity,
   AlertTriangle,
   CheckCircle2,
+  ClipboardCheck,
+  Hand,
   ListChecks,
   MessageSquare,
   Pause,
   Play,
   RefreshCw,
+  ShieldCheck,
+  ShieldOff,
   UserMinus,
   UserPlus,
   Users,
   Wrench,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import type { SessionEvent } from "../types";
+import type { InterventionType, SessionEvent } from "../types";
+import { INTERVENTION_LABELS } from "../utils/labels";
 
 interface Described {
   icon: LucideIcon;
@@ -37,7 +42,7 @@ function describe(e: SessionEvent): Described {
         icon: ListChecks,
         text:
           e.payload.phase === "PLAN"
-            ? "Planning the research"
+            ? String(e.payload.step ?? "Planning")
             : `Step ${e.payload.step_index}/${e.payload.total_steps}: ${e.payload.step}`,
         color: "text-brand-600",
       };
@@ -51,6 +56,34 @@ function describe(e: SessionEvent): Described {
         : { icon: AlertTriangle, text: `${e.payload.tool} failed: ${e.payload.error ?? "error"}`, color: "text-red-600" };
     case "AGENT_MESSAGE":
       return { icon: MessageSquare, text: String(e.payload.text ?? ""), color: "text-slate-600" };
+    case "HUMAN_INTERVENTION": {
+      const iv = e.payload.intervention;
+      const label = INTERVENTION_LABELS[iv?.type as InterventionType] ?? "Intervention";
+      const detail = iv?.content ?? iv?.target;
+      return {
+        icon: Hand,
+        text: `${who}: ${label}${detail ? ` — ${String(detail).slice(0, 80)}` : ""}`,
+        color: "text-brand-600",
+      };
+    }
+    case "CONSTRAINT_ADDED":
+      return { icon: ShieldCheck, text: `${who} added a constraint: ${e.payload.constraint?.description ?? ""}`, color: "text-brand-600" };
+    case "CONSTRAINT_REMOVED":
+      return { icon: ShieldOff, text: `${who} removed the constraint on “${e.payload.target}”`, color: "text-slate-500" };
+    case "APPROVAL_REQUESTED":
+      return {
+        icon: ClipboardCheck,
+        text: e.payload.kind === "FINAL_REPORT" ? "Waiting for approval of the final draft" : "Waiting for a review",
+        color: "text-amber-600",
+      };
+    case "APPROVAL_COMPLETED":
+      return e.payload.expired
+        ? { icon: ClipboardCheck, text: "Approval request closed", color: "text-slate-500" }
+        : {
+            icon: ClipboardCheck,
+            text: `${who} ${e.payload.approved ? "approved" : "rejected"} the ${e.payload.kind === "FINAL_REPORT" ? "final draft" : "review request"}`,
+            color: e.payload.approved ? "text-emerald-600" : "text-red-600",
+          };
     case "COMPLETED":
       return { icon: CheckCircle2, text: "Agent completed the task", color: "text-emerald-600" };
     case "FAILED":

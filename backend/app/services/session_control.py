@@ -7,7 +7,7 @@ from app.agents.runner import agent_runner
 from app.api.deps import SessionContext
 from app.models.session import AgentStatus
 from app.schemas.session import StateResponse
-from app.services import event_service
+from app.services import approval_service, event_service
 from app.websocket.events import EventType
 
 # action -> (allowed current states, new state, specific event, system message)
@@ -26,7 +26,8 @@ TRANSITIONS: dict[str, tuple[set[AgentStatus], AgentStatus, EventType | None, st
     ),
     "resume": ({AgentStatus.PAUSED}, AgentStatus.RUNNING, EventType.RESUMED, "Resumed by {user}."),
     "stop": (
-        {AgentStatus.CREATED, AgentStatus.RUNNING, AgentStatus.PLANNING, AgentStatus.PAUSED},
+        {AgentStatus.CREATED, AgentStatus.RUNNING, AgentStatus.PLANNING,
+         AgentStatus.PAUSED, AgentStatus.WAITING_FOR_APPROVAL},
         AgentStatus.CANCELLED,
         None,
         "Stopped by {user}.",
@@ -78,6 +79,8 @@ async def apply_transition(action: str, ctx: SessionContext, db: Session) -> Sta
         {"kind": "system", "text": template.format(user=user.username)},
         user,
     )
+    if action == "stop" and approval_service.expire_pending(db, session_id):
+        await event_service.publish(db, session_id, EventType.APPROVAL_COMPLETED, {"expired": True}, user)
 
     if action == "start":
         await agent_runner.start(session_id)

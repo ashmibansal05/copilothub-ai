@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     agent_step_delay_seconds: float = 1.5  # pacing of the demo agent
     agent_step_timeout_seconds: float = 180.0
     agent_max_runtime_seconds: float = 900.0  # paused time is not counted
+    agent_require_final_approval: bool = True
+    agent_max_approval_rounds: int = Field(default=3, ge=1, le=10)
+    agent_max_replans: int = Field(default=3, ge=0, le=10)
 
     @field_validator("secret_key")
     @classmethod

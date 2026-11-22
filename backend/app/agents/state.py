@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 from typing import Any
 
 from typing_extensions import TypedDict
@@ -14,5 +15,22 @@ class AgentGraphState(TypedDict, total=False):
     observations: list[dict[str, Any]]
     last_result: dict[str, Any]
     confidence: float
-    decision: str  # "continue" | "retry" | "complete"
+    decision: str  # "continue" | "retry" | "replan" | "complete" | "revise"
     summary: str
+    approval_round: int  # how many times the final draft was rejected
+    approved: bool
+
+
+@dataclass
+class ApprovalDecision:
+    approved: bool
+    note: str | None = None
+    by: str = ""
+
+
+@dataclass
+class HumanContext:
+    """What humans have told the agent, selected for the current prompt."""
+
+    constraints: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)

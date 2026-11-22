@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from app.models.session import AgentStatus
+from app.schemas.intervention import ApprovalRead, ConstraintRead, InterventionRead
 
 
 class AgentStateRead(BaseModel):
@@ -20,10 +21,9 @@ class AgentStateRead(BaseModel):
     plan: list[str] = []
     recent_actions: list[dict[str, Any]] = []
     tool_results: list[dict[str, Any]] = []
-    # Filled in by later phases (constraints, interventions, approvals):
-    active_constraints: list[dict[str, Any]] = []
-    human_interventions: list[dict[str, Any]] = []
-    pending_approval: dict[str, Any] | None = None
+    active_constraints: list[ConstraintRead] = []
+    human_interventions: list[InterventionRead] = []  # most recent first
+    pending_approval: ApprovalRead | None = None
 
 
 class AgentActionRead(BaseModel):

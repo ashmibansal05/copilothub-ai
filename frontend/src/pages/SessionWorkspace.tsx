@@ -1,26 +1,43 @@
-import { Check, Copy, Eye, Loader2, Pause, Play, Square, Wifi, WifiOff } from "lucide-react";
+import {
+  Check, Copy, Eye, Hand, Loader2, MessageSquare, Pause, Play, Plus, ShieldPlus, Square, Wifi, WifiOff,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import AgentPanel from "../components/AgentPanel";
+import ApprovalCard from "../components/ApprovalCard";
+import ConstraintsPanel from "../components/ConstraintsPanel";
 import EventTimeline from "../components/EventTimeline";
+import InterventionDialog from "../components/InterventionDialog";
+import type { DialogKind } from "../components/InterventionDialog";
+import InterventionsPanel from "../components/InterventionsPanel";
+import MemoryPanel from "../components/MemoryPanel";
 import { RoleBadge, StatusBadge } from "../components/StatusBadge";
 import ToolActivity from "../components/ToolActivity";
 import { useSessionSocket } from "../hooks/useSessionSocket";
 import type { ConnectionStatus } from "../hooks/useSessionSocket";
 import { getErrorMessage } from "../services/api";
 import { sessionService } from "../services/sessionService";
-import type { AgentState, ControlAction, SessionDetail, SessionEvent } from "../types";
+import type {
+  AgentState, ControlAction, InterventionPayload, MemoryItem, SessionDetail, SessionEvent,
+} from "../types";
 import { applyAgentEvent, emptyAgentState } from "../utils/agentState";
 
-// Events that have their own panels; keeping them out of the timeline avoids noise.
 const HIDDEN_IN_TIMELINE = new Set(["TOOL_STARTED", "STEP_COMPLETED", "AGENT_MESSAGE"]);
+const TERMINAL = ["COMPLETED", "FAILED", "CANCELLED"];
 
 const MESSAGE_STYLES: Record<string, string> = {
   agent: "bg-slate-50 text-slate-800",
   system: "bg-slate-50 text-slate-500",
   warning: "bg-amber-50 text-amber-800",
   escalation: "bg-red-50 text-red-800",
+  constraint: "bg-brand-50 text-brand-700",
 };
+
+function isHidden(e: SessionEvent): boolean {
+  if (HIDDEN_IN_TIMELINE.has(e.type)) return true;
+  // pause/resume already have their own timeline entries
+  return e.type === "HUMAN_INTERVENTION" && ["PAUSE", "RESUME"].includes(e.payload.intervention?.type);
+}
 
 function ConnectionBadge({ status }: { status: ConnectionStatus }) {
   if (status === "connected")
@@ -67,9 +84,11 @@ export default function SessionWorkspace() {
   const [session, setSession] = useState<SessionDetail | null>(null);
   const [agent, setAgent] = useState<AgentState | null>(null);
   const [events, setEvents] = useState<SessionEvent[]>([]);
+  const [memory, setMemory] = useState<MemoryItem[]>([]);
+  const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<ControlAction | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
 
   const mergeEvents = useCallback((incoming: SessionEvent[]) => {
     setEvents((prev) => {
@@ -90,12 +109,18 @@ export default function SessionWorkspace() {
     }
   }, [id]);
 
+  const loadMemory = useCallback(() => {
+    if (!id) return;
+    sessionService.memory(id).then((m) => setMemory(m.items)).catch(() => undefined);
+  }, [id]);
+
   useEffect(() => {
     if (!id) return;
     loadSession();
+    loadMemory();
     sessionService.events(id).then(mergeEvents).catch(() => undefined);
     sessionService.state(id).then(setAgent).catch(() => undefined);
-  }, [id, loadSession, mergeEvents]);
+  }, [id, loadSession, loadMemory, mergeEvents]);
 
   const handleEvent = useCallback(
     (e: SessionEvent) => {
@@ -107,26 +132,39 @@ export default function SessionWorkspace() {
         setSession((s) => (s ? { ...s, status: e.payload.status } : s));
       }
       if (e.type === "MEMBER_JOINED") loadSession();
+      if (e.type === "HUMAN_INTERVENTION") {
+        const iv = e.payload.intervention;
+        if (iv?.type === "MODIFY_TASK" && iv.content) {
+          setSession((s) => (s ? { ...s, task: iv.content } : s));
+        }
+        loadMemory();
+      }
+      if (e.type === "APPROVAL_COMPLETED") loadMemory();
       setAgent((prev) => (prev ? applyAgentEvent(prev, e) : prev));
       mergeEvents([e]);
     },
-    [loadSession, mergeEvents]
+    [loadSession, loadMemory, mergeEvents]
   );
 
   const { status: connStatus, online } = useSessionSocket(id, handleEvent);
 
-  const run = async (action: ControlAction) => {
-    if (!id) return;
-    setBusy(action);
+  const attempt = async (key: string, fn: () => Promise<unknown>) => {
+    setBusy(key);
     setActionError(null);
     try {
-      await sessionService.control(id, action);
+      await fn();
       loadSession(); // fallback in case the socket is down
     } catch (err) {
       setActionError(getErrorMessage(err));
     } finally {
       setBusy(null);
     }
+  };
+
+  const control = (action: ControlAction) => attempt(action, () => sessionService.control(id!, action));
+  const quick = (payload: InterventionPayload) => attempt(payload.type, () => sessionService.intervene(id!, payload));
+  const submitDialog = async (payload: InterventionPayload) => {
+    await sessionService.intervene(id!, payload);
   };
 
   if (loadError) {
@@ -148,17 +186,31 @@ export default function SessionWorkspace() {
   const role = session.my_role;
   const status = session.status;
   const agentState = agent ?? emptyAgentState(session.id, session.task, status);
-  const canStart = role === "OWNER" && status === "CREATED";
+  const pending = agentState.pending_approval;
+  const ended = TERMINAL.includes(status);
+  const isOwner = role === "OWNER";
+  const canGuide = role !== "VIEWER" && !ended;
+  const canStart = isOwner && status === "CREATED";
   const canPause = role !== "VIEWER" && (status === "RUNNING" || status === "PLANNING");
   const canResume = role !== "VIEWER" && status === "PAUSED";
-  const canStop = role === "OWNER" && ["CREATED", "RUNNING", "PLANNING", "PAUSED"].includes(status);
+  const canStop = isOwner && !ended;
+  const canReview = role !== "VIEWER" && ["RUNNING", "PLANNING", "PAUSED"].includes(status) && !pending;
   const onlineIds = new Set(online.map((u) => u.user_id));
   const agentMessages = events.filter((e) => e.type === "AGENT_MESSAGE");
-  const timelineEvents = events.filter((e) => !HIDDEN_IN_TIMELINE.has(e.type));
+  const timelineEvents = events.filter((e) => !isHidden(e));
   const origin = window.location.origin;
 
   return (
     <div className="space-y-4">
+      {dialog && (
+        <InterventionDialog
+          kind={dialog}
+          initialText={dialog === "MODIFY_TASK" ? session.task : ""}
+          onClose={() => setDialog(null)}
+          onSubmit={submitDialog}
+        />
+      )}
+
       {/* Session header */}
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-3 shadow-sm">
         <div>
@@ -176,20 +228,35 @@ export default function SessionWorkspace() {
         {/* Left: timeline */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
           <h2 className="mb-3 font-semibold">Activity timeline</h2>
-          <div className="max-h-[640px] overflow-y-auto pr-1">
+          <div className="max-h-[720px] overflow-y-auto pr-1">
             <EventTimeline events={timelineEvents} />
           </div>
         </aside>
 
-        {/* Center: task, agent, tools, messages */}
+        {/* Center */}
         <section className="min-w-0 space-y-4">
+          {pending && (
+            <ApprovalCard
+              approval={pending}
+              canDecide={role !== "VIEWER"}
+              canModify={isOwner}
+              busy={busy !== null}
+              onApprove={() => quick({ type: "APPROVE" })}
+              onReject={() => setDialog("REJECT")}
+              onModify={() => setDialog("MODIFY_TASK")}
+            />
+          )}
+
           <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="font-semibold">Current task</h2>
             <p className="mt-2 text-sm text-slate-700">{session.task}</p>
           </div>
 
           <AgentPanel agent={agentState} status={status} />
-          <ToolActivity events={events} />
+          <ToolActivity
+            events={events}
+            onRejectSource={canGuide ? (publisher) => quick({ type: "REJECT_SOURCE", target: publisher }) : undefined}
+          />
 
           <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="mb-3 font-semibold">Agent messages</h2>
@@ -213,10 +280,21 @@ export default function SessionWorkspace() {
               </ul>
             )}
           </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <InterventionsPanel items={agentState.human_interventions} />
+            <MemoryPanel items={memory} />
+          </div>
         </section>
 
-        {/* Right: collaborators + invites */}
+        {/* Right */}
         <aside className="space-y-4">
+          <ConstraintsPanel
+            constraints={agentState.active_constraints}
+            canEdit={canGuide}
+            onRemove={(cid) => attempt("remove", () => sessionService.removeConstraint(id!, cid))}
+          />
+
           <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="mb-3 font-semibold">Collaborators ({session.members.length})</h2>
             <ul className="space-y-3">
@@ -235,7 +313,7 @@ export default function SessionWorkspace() {
             </ul>
           </div>
 
-          {role === "OWNER" && session.editor_code && session.viewer_code && (
+          {isOwner && session.editor_code && session.viewer_code && (
             <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
               <h2 className="font-semibold">Invite links</h2>
               <CopyRow label="Editor link" value={`${origin}/join/${session.editor_code}`} />
@@ -246,42 +324,67 @@ export default function SessionWorkspace() {
       </div>
 
       {/* Bottom action bar */}
-      <div className="sticky bottom-3 rounded-2xl border border-slate-200 bg-white/95 p-3 shadow-lg backdrop-blur">
+      <div className="sticky bottom-3 space-y-2 rounded-2xl border border-slate-200 bg-white/95 p-3 shadow-lg backdrop-blur">
         {actionError && (
-          <div role="alert" className="mb-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
-            {actionError}
-          </div>
+          <div role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{actionError}</div>
         )}
-        <div className="flex flex-wrap items-center gap-2">
-          {role === "VIEWER" && (
-            <span className="inline-flex items-center gap-2 text-sm text-slate-500">
-              <Eye className="h-4 w-4" /> View-only: you can watch but not control the agent.
-            </span>
-          )}
-          {canStart && (
-            <button className="btn-primary" disabled={busy !== null} onClick={() => run("start")}>
-              <Play className="h-4 w-4" /> Start agent
-            </button>
-          )}
-          {canPause && (
-            <button className="btn-secondary" disabled={busy !== null} onClick={() => run("pause")}>
-              <Pause className="h-4 w-4" /> Pause
-            </button>
-          )}
-          {canResume && (
-            <button className="btn-primary" disabled={busy !== null} onClick={() => run("resume")}>
-              <Play className="h-4 w-4" /> Resume
-            </button>
-          )}
-          {canStop && (
-            <button className="btn-secondary !text-red-700" disabled={busy !== null} onClick={() => run("stop")}>
-              <Square className="h-4 w-4" /> Stop
-            </button>
-          )}
-          {role !== "VIEWER" && !canStart && !canPause && !canResume && !canStop && (
-            <span className="text-sm text-slate-500">No actions available while the session is {status.toLowerCase()}.</span>
-          )}
-        </div>
+        {role === "VIEWER" && (
+          <span className="inline-flex items-center gap-2 text-sm text-slate-500">
+            <Eye className="h-4 w-4" /> View-only: you can watch but not control the agent.
+          </span>
+        )}
+        {role !== "VIEWER" && (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <button className="btn-secondary" onClick={() => setDialog("COMMENT")}>
+                <MessageSquare className="h-4 w-4" /> Comment
+              </button>
+              <button className="btn-secondary" disabled={!canGuide} onClick={() => setDialog("CORRECT")}>
+                <Hand className="h-4 w-4" /> Correct
+              </button>
+              <button className="btn-secondary" disabled={!canGuide} onClick={() => setDialog("ADD_INFORMATION")}>
+                <Plus className="h-4 w-4" /> Add info
+              </button>
+              <button className="btn-secondary" disabled={!canGuide} onClick={() => setDialog("CONSTRAINT")}>
+                <ShieldPlus className="h-4 w-4" /> Add constraint
+              </button>
+              {canReview && (
+                <button className="btn-secondary" onClick={() => setDialog("REQUEST_REVIEW")}>Request review</button>
+              )}
+              {isOwner && !ended && (
+                <button className="btn-secondary" onClick={() => setDialog("MODIFY_TASK")}>Modify task</button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {pending && (
+                <>
+                  <button className="btn-primary" disabled={busy !== null} onClick={() => quick({ type: "APPROVE" })}>Approve</button>
+                  <button className="btn-secondary" disabled={busy !== null} onClick={() => setDialog("REJECT")}>Reject</button>
+                </>
+              )}
+              {canStart && (
+                <button className="btn-primary" disabled={busy !== null} onClick={() => control("start")}>
+                  <Play className="h-4 w-4" /> Start agent
+                </button>
+              )}
+              {canPause && (
+                <button className="btn-secondary" disabled={busy !== null} onClick={() => quick({ type: "PAUSE" })}>
+                  <Pause className="h-4 w-4" /> Pause
+                </button>
+              )}
+              {canResume && (
+                <button className="btn-primary" disabled={busy !== null} onClick={() => quick({ type: "RESUME" })}>
+                  <Play className="h-4 w-4" /> Resume
+                </button>
+              )}
+              {canStop && (
+                <button className="btn-secondary !text-red-700" disabled={busy !== null} onClick={() => control("stop")}>
+                  <Square className="h-4 w-4" /> Stop
+                </button>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

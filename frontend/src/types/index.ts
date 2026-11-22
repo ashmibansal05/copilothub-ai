@@ -100,6 +100,79 @@ export interface OnlineUser {
 }
 // ---------- Agent (Phase 5) ----------
 
+// ---------- Interventions, constraints, memory (Phases 7-8) ----------
+
+export type InterventionType =
+  | "APPROVE" | "REJECT" | "CORRECT" | "PAUSE" | "RESUME" | "MODIFY_TASK"
+  | "ADD_INFORMATION" | "ADD_CONSTRAINT" | "REMOVE_CONSTRAINT" | "REJECT_SOURCE"
+  | "CHANGE_SOURCE" | "REQUEST_REVIEW" | "COMMENT";
+
+export type Priority = "LOW" | "MEDIUM" | "HIGH";
+export type ConstraintAction = "EXCLUDE_SOURCE" | "INCLUDE_SOURCE" | "PREFER_SOURCE" | "INSTRUCTION";
+
+export interface Intervention {
+  id: string;
+  session_id: string;
+  user_id: string | null;
+  username: string | null;
+  type: InterventionType;
+  content: string | null;
+  target: string | null;
+  priority: Priority;
+  status: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  details: Record<string, any>;
+  result: string | null;
+  created_at: string;
+}
+
+export interface Constraint {
+  id: string;
+  session_id: string;
+  type: "CONSTRAINT";
+  action: ConstraintAction;
+  target: string;
+  description: string;
+  priority: Priority;
+  status: string;
+  created_by: string | null;
+  created_by_username: string | null;
+  created_at: string;
+}
+
+export interface PendingApproval {
+  id: string;
+  kind: "FINAL_REPORT" | "REVIEW";
+  status: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  payload: Record<string, any>;
+  created_at: string;
+}
+
+export interface MemoryItem {
+  id: string;
+  kind: "FACT" | "CORRECTION" | "DECISION" | "REJECTED_SOURCE" | "APPROVED_SOURCE";
+  key: string | null;
+  content: string;
+  importance: number;
+  author: string | null;
+  created_at: string;
+}
+
+export interface MemoryView {
+  constraints: Constraint[];
+  items: MemoryItem[];
+}
+
+export interface InterventionPayload {
+  type: InterventionType;
+  content?: string;
+  target?: string;
+  priority?: Priority;
+  action?: ConstraintAction;
+  constraint_id?: string;
+}
+
 export interface AgentState {
   session_id: string;
   status: AgentStatus;
@@ -113,7 +186,7 @@ export interface AgentState {
   plan: string[];
   recent_actions: Record<string, unknown>[];
   tool_results: Record<string, unknown>[];
-  active_constraints: unknown[];
-  human_interventions: unknown[];
-  pending_approval: unknown | null;
+  active_constraints: Constraint[];
+  human_interventions: Intervention[]; // most recent first
+  pending_approval: PendingApproval | null;
 }

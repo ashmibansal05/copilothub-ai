@@ -4,6 +4,7 @@ import uuid
 
 from app.agents.factory import create_brain
 from app.agents.orchestrator import AgentOrchestrator
+from app.agents.state import ApprovalDecision
 
 logger = logging.getLogger("copilothub.agent")
 
@@ -30,12 +31,15 @@ class AgentRunner:
         task.add_done_callback(lambda t, sid=session_id: self._cleanup(sid, t))
         return True
 
+    def _active(self, session_id: uuid.UUID) -> AgentOrchestrator | None:
+        return self._orchestrators.get(session_id) if self.is_active(session_id) else None
+
     def pause(self, session_id: uuid.UUID) -> None:
-        if (orch := self._orchestrators.get(session_id)) is not None:
+        if (orch := self._active(session_id)) is not None:
             orch.pause()
 
     def resume(self, session_id: uuid.UUID) -> None:
-        if (orch := self._orchestrators.get(session_id)) is not None:
+        if (orch := self._active(session_id)) is not None:
             orch.resume()
 
     async def stop(self, session_id: uuid.UUID) -> None:
@@ -43,6 +47,25 @@ class AgentRunner:
         if task is not None and not task.done():
             task.cancel()
             await asyncio.wait({task}, timeout=3)
+
+    # ---- human input that reaches the running agent (all return False if no agent runs)
+    def resolve_approval(self, session_id: uuid.UUID, approval_id: uuid.UUID, decision: ApprovalDecision) -> bool:
+        orch = self._active(session_id)
+        return orch.resolve_approval(approval_id, decision) if orch else False
+
+    def request_review(self, session_id: uuid.UUID, user_id: uuid.UUID | None, username: str, note: str | None) -> bool:
+        orch = self._active(session_id)
+        if orch is None:
+            return False
+        orch.request_review(user_id, username, note)
+        return True
+
+    def request_replan(self, session_id: uuid.UUID) -> bool:
+        orch = self._active(session_id)
+        if orch is None:
+            return False
+        orch.request_replan()
+        return True
 
     def _cleanup(self, session_id: uuid.UUID, task: asyncio.Task) -> None:
         if self._tasks.get(session_id) is task:

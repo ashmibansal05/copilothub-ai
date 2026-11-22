@@ -20,14 +20,38 @@ GENERIC_PLAN = [
     "Draft conclusions",
 ]
 
-# Placeholder source names. Nothing here is fetched from the internet.
-SOURCE_BANK: dict[str, list[tuple[str, str]]] = {
-    "aws": [("AWS pricing overview", "Amazon Web Services"), ("AWS Free Tier summary", "Amazon Web Services")],
-    "azure": [("Azure pricing overview", "Microsoft"), ("Azure for startups summary", "Microsoft")],
-    "google": [("Google Cloud pricing overview", "Google Cloud"), ("Google Cloud free program summary", "Google Cloud")],
-    "criteria": [("Cloud computing overview", "Wikipedia"), ("Choosing a cloud provider: startup guide", "Industry blog")],
-    "compare": [("Cloud provider comparison notes", "Analyst blog")],
-    "default": [("Background overview", "Wikipedia"), ("Topic explainer", "Industry blog")],
+OFFICIAL = "official documentation"
+
+# Placeholder sources (title, publisher, source_type). Nothing is fetched from the
+# internet; they exist so source constraints can be demonstrated.
+SOURCE_BANK: dict[str, list[tuple[str, str, str]]] = {
+    "aws": [
+        ("Cloud cost tips for founders", "Startup blog", "blog"),
+        ("AWS pricing overview", "Amazon Web Services", OFFICIAL),
+        ("AWS Free Tier summary", "Amazon Web Services", OFFICIAL),
+        ("Amazon Web Services - Wikipedia", "Wikipedia", "encyclopedia"),
+    ],
+    "azure": [
+        ("Azure vs the rest: a founder's view", "Startup blog", "blog"),
+        ("Azure pricing overview", "Microsoft", OFFICIAL),
+        ("Azure for startups summary", "Microsoft", OFFICIAL),
+        ("Microsoft Azure - Wikipedia", "Wikipedia", "encyclopedia"),
+    ],
+    "google": [
+        ("Google Cloud in five minutes", "Startup blog", "blog"),
+        ("Google Cloud pricing overview", "Google Cloud", OFFICIAL),
+        ("Google Cloud free program summary", "Google Cloud", OFFICIAL),
+        ("Google Cloud Platform - Wikipedia", "Wikipedia", "encyclopedia"),
+    ],
+    "criteria": [
+        ("Cloud computing - Wikipedia", "Wikipedia", "encyclopedia"),
+        ("Choosing a cloud provider: startup guide", "Industry blog", "blog"),
+    ],
+    "compare": [("Cloud provider comparison notes", "Analyst blog", "analyst")],
+    "default": [
+        ("Background overview", "Wikipedia", "encyclopedia"),
+        ("Topic explainer", "Industry blog", "blog"),
+    ],
 }
 
 
@@ -46,7 +70,7 @@ class MockBrain(AgentBrain):
         if self.delay > 0:
             await asyncio.sleep(self.delay)
 
-    async def make_plan(self, task: str, constraints: list[str], max_steps: int) -> list[str]:
+    async def make_plan(self, task, constraints, max_steps, notes=None) -> list[str]:
         await self._pause()
         lowered = task.lower()
         is_cloud = any(k in lowered for k in ("aws", "azure", "google cloud", "cloud platform"))
@@ -78,9 +102,12 @@ class MockBrain(AgentBrain):
             key = "compare"
         else:
             key = "default"
-        return [{"title": t, "publisher": p, "simulated": True} for t, p in SOURCE_BANK[key]]
+        return [
+            {"title": t, "publisher": p, "source_type": st, "simulated": True}
+            for t, p, st in SOURCE_BANK[key]
+        ]
 
-    async def execute_step(self, task, step, history, constraints) -> StepResult:
+    async def execute_step(self, task, step, history, constraints, notes=None) -> StepResult:
         await self._pause()
         sources = self._sources_for(step)
         return StepResult(
@@ -98,11 +125,26 @@ class MockBrain(AgentBrain):
         confidence = min(0.92, 0.6 + 0.05 * (len(history) + 1))
         return Evaluation(confidence=round(confidence, 2), ok=True, note="Simulated evaluation (demo mode)")
 
-    async def summarize(self, task, history) -> str:
+    async def summarize(self, task, history, constraints=None, notes=None) -> str:
         await self._pause()
-        lines = "\n".join(f"- {h['step']}" for h in history if h.get("success"))
-        return (
-            "[Demo mode] This is a placeholder summary produced without a language model.\n"
-            f"Steps completed:\n{lines}\n"
-            "Switch DEMO_MODE=false with Ollama running to get real model output."
-        )
+        steps = "\n".join(f"- {h['step']}" for h in history if h.get("success"))
+        seen: set[tuple[str, str]] = set()
+        source_lines: list[str] = []
+        for h in history:
+            for s in h.get("sources", []):
+                key = (s["title"], s["publisher"])
+                if key not in seen:
+                    seen.add(key)
+                    flag = " (preferred)" if s.get("preferred") else ""
+                    source_lines.append(f"- {s['title']} [{s['publisher']}]{flag}")
+        parts = [
+            "[Demo mode] This is a placeholder summary produced without a language model.",
+            f"Steps completed:\n{steps}",
+            "Sources used (simulated):\n" + ("\n".join(source_lines) or "- none"),
+        ]
+        if constraints:
+            parts.append("Human constraints in force:\n" + "\n".join(f"- {c}" for c in constraints))
+        if notes:
+            parts.append("Human guidance taken into account:\n" + "\n".join(f"- {n}" for n in notes))
+        parts.append("Switch DEMO_MODE=false with Ollama running to get real model output.")
+        return "\n\n".join(parts)
