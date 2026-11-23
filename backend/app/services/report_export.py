@@ -1,0 +1,79 @@
+import html
+import io
+import re
+
+from app.models.report import Report
+
+
+def safe_filename(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "report"
+
+
+def _sections(report: Report) -> list[dict]:
+    return report.sections or [{"key": "content", "title": "Report", "body": report.content}]
+
+
+def to_markdown(report: Report) -> bytes:
+    return report.content.encode("utf-8")
+
+
+def _body_html(body: str) -> str:
+    out, bullets = [], []
+
+    def flush():
+        if bullets:
+            out.append("<ul>" + "".join(f"<li>{html.escape(b)}</li>" for b in bullets) + "</ul>")
+            bullets.clear()
+
+    for block in re.split(r"\n\s*\n", body.strip()):
+        for line in block.split("\n"):
+            if line.startswith("- "):
+                bullets.append(line[2:])
+            else:
+                flush()
+                if line.strip():
+                    out.append(f"<p>{html.escape(line)}</p>")
+        flush()
+    return "".join(out)
+
+
+def to_html(report: Report) -> bytes:
+    """Every piece of text is escaped: report content is never interpreted as HTML."""
+    parts = "".join(
+        f"<h2>{n}. {html.escape(s['title'])}</h2>{_body_html(s['body'])}" for n, s in enumerate(_sections(report), 1)
+    )
+    engine = f"<p><em>Engine: {html.escape(report.engine)}</em></p>" if report.engine else ""
+    page = (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        f"<title>{html.escape(report.title)}</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem;line-height:1.5}"
+        "h1{margin-bottom:.25rem}h2{margin-top:2rem;border-bottom:1px solid #ddd}</style></head>"
+        f"<body><h1>{html.escape(report.title)}</h1>{engine}{parts}</body></html>"
+    )
+    return page.encode("utf-8")
+
+
+def to_docx(report: Report) -> bytes:
+    import docx
+
+    document = docx.Document()
+    document.add_heading(report.title, level=0)
+    if report.engine:
+        document.add_paragraph(f"Engine: {report.engine}")
+    for n, section in enumerate(_sections(report), 1):
+        document.add_heading(f"{n}. {section['title']}", level=1)
+        for line in section["body"].split("\n"):
+            if line.startswith("- "):
+                document.add_paragraph(line[2:], style="List Bullet")
+            elif line.strip():
+                document.add_paragraph(line)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+EXPORTERS = {
+    "md": ("text/markdown; charset=utf-8", to_markdown),
+    "html": ("text/html; charset=utf-8", to_html),
+    "docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", to_docx),
+}

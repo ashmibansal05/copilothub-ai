@@ -1,3 +1,5 @@
+
+import asyncio
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
@@ -7,11 +9,15 @@ from app.agents.runner import agent_runner
 from app.api.deps import SessionContext
 from app.models.session import AgentStatus
 from app.schemas.session import StateResponse
-from app.services import approval_service, event_service
+from app.services import approval_service, analytics_service, event_service
 from app.websocket.events import EventType
 
+
 # action -> (allowed current states, new state, specific event, system message)
-TRANSITIONS: dict[str, tuple[set[AgentStatus], AgentStatus, EventType | None, str]] = {
+TRANSITIONS: dict[
+    str,
+    tuple[set[AgentStatus], AgentStatus, EventType | None, str]
+] = {
     "start": (
         {AgentStatus.CREATED},
         AgentStatus.RUNNING,
@@ -24,10 +30,20 @@ TRANSITIONS: dict[str, tuple[set[AgentStatus], AgentStatus, EventType | None, st
         EventType.PAUSED,
         "Paused by {user}. The agent stops after its current step.",
     ),
-    "resume": ({AgentStatus.PAUSED}, AgentStatus.RUNNING, EventType.RESUMED, "Resumed by {user}."),
+    "resume": (
+        {AgentStatus.PAUSED},
+        AgentStatus.RUNNING,
+        EventType.RESUMED,
+        "Resumed by {user}.",
+    ),
     "stop": (
-        {AgentStatus.CREATED, AgentStatus.RUNNING, AgentStatus.PLANNING,
-         AgentStatus.PAUSED, AgentStatus.WAITING_FOR_APPROVAL},
+        {
+            AgentStatus.CREATED,
+            AgentStatus.RUNNING,
+            AgentStatus.PLANNING,
+            AgentStatus.PAUSED,
+            AgentStatus.WAITING_FOR_APPROVAL,
+        },
         AgentStatus.CANCELLED,
         None,
         "Stopped by {user}.",
@@ -35,54 +51,105 @@ TRANSITIONS: dict[str, tuple[set[AgentStatus], AgentStatus, EventType | None, st
 }
 
 
-async def apply_transition(action: str, ctx: SessionContext, db: Session) -> StateResponse:
+async def apply_transition(
+    action: str,
+    ctx: SessionContext,
+    db: Session,
+) -> StateResponse:
     allowed_from, target, event_type, template = TRANSITIONS[action]
+
     session = ctx.session
     session_id = session.id
     previous = session.status
 
     if previous not in allowed_from:
         raise HTTPException(
-            status.HTTP_409_CONFLICT, f"Cannot {action} a session that is {previous.value}"
+            status.HTTP_409_CONFLICT,
+            f"Cannot {action} a session that is {previous.value}",
         )
 
     now = datetime.now(timezone.utc)
     session.status = target
+
     if action == "start":
         session.started_at = now
+
     if target == AgentStatus.CANCELLED:
         session.ended_at = now
+
     db.commit()
 
     # Tell the agent runner right after the DB change.
     if action == "pause":
         agent_runner.pause(session_id)
+
     elif action == "resume":
         agent_runner.resume(session_id)
+
     elif action == "stop":
         await agent_runner.stop(session_id)
 
     user = ctx.user
+
     if event_type is not None:
-        await event_service.publish(db, session_id, event_type, {}, user)
+        await event_service.publish(
+            db,
+            session_id,
+            event_type,
+            {},
+            user,
+        )
+
     await event_service.publish(
         db,
         session_id,
         EventType.STATUS_CHANGED,
-        {"status": target.value, "previous_status": previous.value},
+        {
+            "status": target.value,
+            "previous_status": previous.value,
+        },
         user,
     )
+
     await event_service.publish(
         db,
         session_id,
         EventType.AGENT_MESSAGE,
-        {"kind": "system", "text": template.format(user=user.username)},
+        {
+            "kind": "system",
+            "text": template.format(user=user.username),
+        },
         user,
     )
-    if action == "stop" and approval_service.expire_pending(db, session_id):
-        await event_service.publish(db, session_id, EventType.APPROVAL_COMPLETED, {"expired": True}, user)
+
+    if action == "stop" and approval_service.expire_pending(
+        db, session_id
+    ):
+        await event_service.publish(
+            db,
+            session_id,
+            EventType.APPROVAL_COMPLETED,
+            {"expired": True},
+            user,
+        )
+
+    # -------------------------------------------------------------
+    # Phase 14 - Record session analytics when stopped
+    # -------------------------------------------------------------
+    if action == "stop":
+        try:
+            await asyncio.to_thread(
+                analytics_service.record_session_end,
+                session_id,
+            )
+        except Exception:
+            pass  # Analytics must never block stopping a session.
 
     if action == "start":
         await agent_runner.start(session_id)
 
-    return StateResponse(session_id=session_id, status=target, previous_status=previous)
+    return StateResponse(
+        session_id=session_id,
+        status=target,
+        previous_status=previous,
+    )

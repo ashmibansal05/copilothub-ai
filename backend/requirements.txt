@@ -17,6 +17,10 @@ numpy>=1.26
 scikit-learn>=1.4
 faiss-cpu>=1.8
 
+# ML Intervention Predictor (Phase 13)
+pandas>=2.1
+xgboost>=2.0
+
 # Full neural embeddings can be enabled later
 # sentence-transformers>=3.0
 

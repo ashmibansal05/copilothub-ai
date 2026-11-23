@@ -19,6 +19,7 @@ from app.agents.prompts import (
     build_messages,
     build_tool_messages,
     fence,
+    REPORT_INSTRUCTION,
 )
 from app.llm.base import LLMProvider, LLMResponseError
 from app.llm.utils import extract_json
@@ -338,3 +339,59 @@ class LLMBrain(AgentBrain):
             messages,
             max_tokens=500,
         )
+
+    # ============================================================
+    # Phase 14 - Final Research Report
+    # ============================================================
+
+    async def write_report(
+        self,
+        task,
+        history,
+        constraints=None,
+        notes=None,
+    ) -> dict[str, str]:
+        material = [
+            f"Step {h['step_index']} ({h['step']}): {h['finding'][:400]}"
+            + (
+                " | sources: "
+                + ", ".join(
+                    f"{s['title']} ({s['publisher']})"
+                    for s in h.get("sources", [])[:4]
+                )
+                if h.get("sources")
+                else ""
+            )
+            for h in history[-12:]
+        ]
+
+        messages = build_messages(
+            task,
+            REPORT_INSTRUCTION,
+            constraints,
+            tool_results=material,
+            human_notes=notes,
+        )
+
+        raw = await self.provider.generate(
+            messages,
+            json_mode=True,
+            max_tokens=900,
+        )
+
+        data = extract_json(raw)
+
+        if not isinstance(data, dict):
+            raise LLMResponseError(
+                "The report reply is not a JSON object"
+            )
+
+        return {
+            key: str(data.get(key) or "").strip()
+            for key in (
+                "executive_summary",
+                "findings",
+                "comparison",
+                "conclusion",
+            )
+        }

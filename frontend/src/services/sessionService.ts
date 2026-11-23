@@ -17,6 +17,12 @@ import type {
   InstructionResult,
   ReportDetail,
   ReportSummary,
+
+  // Phase 13 and 14
+  AnalyticsOverview,
+  MLStatus,
+  RiskEstimate,
+  SessionAnalytics,
 } from "../types";
 
 export const sessionService = {
@@ -98,7 +104,9 @@ export const sessionService = {
   // ============================================================
 
   documents: (id: string) =>
-    api.get<DocumentInfo[]>(`/sessions/${id}/documents`).then((r) => r.data),
+    api
+      .get<DocumentInfo[]>(`/sessions/${id}/documents`)
+      .then((r) => r.data),
 
   uploadDocument: (
     id: string,
@@ -166,5 +174,77 @@ export const sessionService = {
         `/sessions/${id}/instructions`,
         { text }
       )
+      .then((r) => r.data),
+
+  // ============================================================
+  // Phase 13: ML Intervention-Risk Prediction
+  // ============================================================
+
+  risk: (id: string) =>
+    api
+      .get<RiskEstimate>(`/sessions/${id}/risk`)
+      .then((r) => r.data),
+
+  mlStatus: () =>
+    api
+      .get<MLStatus>("/ml/status")
+      .then((r) => r.data),
+
+  // ============================================================
+  // Phase 14: Final Research Reports
+  // ============================================================
+
+  finalReport: (id: string) =>
+    api
+      .get<ReportDetail>(`/sessions/${id}/report`)
+      .then((r) => r.data),
+
+  generateReport: (id: string) =>
+    api
+      .post(`/sessions/${id}/report/generate`)
+      .then((r) => r.data),
+
+  /**
+   * Downloads require JWT authentication.
+   * Fetch the file as a blob and save it locally.
+   */
+  downloadReport: async (
+    id: string,
+    reportId: string,
+    format: "md" | "html" | "docx"
+  ) => {
+    const response = await api.get(
+      `/sessions/${id}/reports/${reportId}/download`,
+      {
+        params: { format },
+        responseType: "blob",
+      }
+    );
+
+    const url = URL.createObjectURL(response.data as Blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = `report.${format}`;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    URL.revokeObjectURL(url);
+  },
+
+  // ============================================================
+  // Phase 14: Analytics
+  // ============================================================
+
+  sessionAnalytics: (id: string) =>
+    api
+      .get<SessionAnalytics>(`/sessions/${id}/analytics`)
+      .then((r) => r.data),
+
+  analyticsOverview: () =>
+    api
+      .get<AnalyticsOverview>("/analytics/overview")
       .then((r) => r.data),
 };

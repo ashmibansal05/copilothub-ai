@@ -1,15 +1,15 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, Uuid, func
+from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
 
 
 class Report(Base):
-    """A report draft. Phase 11's save_report tool writes these; Phase 14 builds the
-    structured final report on the same table."""
+    """Either a draft saved by the agent's save_report tool (kind DRAFT) or the structured
+    final research report (kind FINAL, with `sections`)."""
 
     __tablename__ = "reports"
 
@@ -18,10 +18,13 @@ class Report(Base):
         ForeignKey("sessions.id", ondelete="CASCADE"), index=True
     )
     title: Mapped[str] = mapped_column(String(200))
-    content: Mapped[str] = mapped_column(Text)  # plain Markdown text; the UI shows it as text
+    content: Mapped[str] = mapped_column(Text)  # Markdown rendering, shown as plain text
     format: Mapped[str] = mapped_column(String(12), default="markdown")
-    origin: Mapped[str] = mapped_column(String(12), default="AGENT")
+    origin: Mapped[str] = mapped_column(String(12), default="AGENT")  # AGENT | SYSTEM
     status: Mapped[str] = mapped_column(String(12), default="DRAFT")
+    kind: Mapped[str] = mapped_column(String(10), default="DRAFT", server_default="DRAFT")  # DRAFT | FINAL
+    engine: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    sections: Mapped[list | None] = mapped_column(JSON, nullable=True)  # [{key, title, body}]
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

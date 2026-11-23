@@ -58,6 +58,13 @@ TOOL_STEP_INSTRUCTION = (
     'To use a tool reply {{"action": "tool", "tool": "<tool name>", "arguments": {{...}}}}. '
     'When you have enough evidence reply {{"action": "final", "findings": "<at most 150 words, citing sources by title>"}}.'
 )
+REPORT_INSTRUCTION = (
+    "Write the narrative parts of a research report as JSON with exactly these keys: "
+    '{{"executive_summary": "...", "findings": "...", "comparison": "...", "conclusion": "..."}}. '
+    "Use ONLY the material in <tool_results> and <human_notes>. Obey every human constraint. "
+    "If the material is not enough for a section, say so plainly instead of guessing. "
+    "Never invent numbers, sources or URLs. At most 150 words per section."
+)
 
 FORCE_FINAL_SUFFIX = ' You may NOT call any more tools: reply now with {{"action": "final", "findings": "..."}}.'
 

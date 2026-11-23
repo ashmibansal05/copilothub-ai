@@ -264,18 +264,183 @@ export interface SearchHit {
 }
 // ---------- Reports (Phase 11) ----------
 
+export interface ReportSection {
+  key: string;
+  title: string;
+  body: string;
+}
+
 export interface ReportSummary {
   id: string;
   title: string;
   format: string;
   origin: string;
   status: string;
+  kind: "DRAFT" | "FINAL";
+  engine: string | null;
   chars: number;
   created_at: string;
 }
 
 export interface ReportDetail extends ReportSummary {
   content: string;
+  sections: ReportSection[] | null;
+}
+
+// ---------- ML risk (Phase 13) ----------
+
+export interface RiskFactor {
+  feature: string;
+  label: string;
+  effect: number;
+  value: number;
+}
+
+export interface RiskEstimate {
+  available: boolean;
+  reason?: string | null;
+  probability?: number | null;
+  level?: "LOW" | "MEDIUM" | "HIGH" | null;
+  model?: string | null;
+  data_source?: string | null;
+  step_index?: number | null;
+  factors: RiskFactor[];
+  warning?: string | null;
+}
+
+export interface ModelScores {
+  cv_roc_auc_mean: number;
+  cv_roc_auc_std: number;
+  test: { accuracy: number; precision: number; recall: number; f1: number; roc_auc: number };
+}
+
+export interface MLStatus {
+  available: boolean;
+  data_source?: string | null;
+  trained_at?: string | null;
+  selected_model?: string | null;
+  selection_rule?: string | null;
+  n_rows?: number | null;
+  n_test?: number | null;
+  positive_rate?: number | null;
+  models: Record<string, ModelScores>;
+  baseline?: { accuracy: number; precision: number; recall: number; f1: number; roc_auc: number; rule: string } | null;
+  warning?: string | null;
+}
+
+// ---------- Analytics (Phase 14) ----------
+
+export interface ToolStat { tool: string; calls: number; failures: number }
+export interface RiskSummary {
+  data_source: string | null;
+  n: number;
+  mean: number | null;
+  max: number | null;
+  last: number | null;
+  history: { step_index: number; probability: number; level: string }[];
+  observed_n: number;
+  mean_when_intervened: number | null;
+  mean_when_not: number | null;
+}
+
+export interface SessionAnalytics {
+  session_id: string;
+  name: string;
+  status: string;
+  engine: string | null;
+  duration_seconds: number | null;
+  steps_planned: number;
+  steps_completed: number;
+  confidence_series: { step_index: number; confidence: number }[];
+  avg_confidence: number | null;
+  final_confidence: number | null;
+  min_confidence: number | null;
+  interventions_total: number;
+  comments: number;
+  corrective: number;
+  interventions_by_type: Record<string, number>;
+  interventions_by_user: Record<string, number>;
+  tool_calls: number;
+  tool_failures: number;
+  tool_failure_rate: number | null;
+  tools: ToolStat[];
+  failed_attempts: number;
+  recovered: boolean;
+  approvals_requested: number;
+  approvals_approved: number;
+  approvals_rejected: number;
+  approval_rate: number | null;
+  conflicts_total: number;
+  conflicts_open: number;
+  conflicts_resolved: number;
+  sources_used: number;
+  sources_rejected: number;
+  source_rejection_rate: number | null;
+  documents: number;
+  risk: RiskSummary;
+}
+
+export interface ResearchGroup {
+  label: string;
+  sessions: number;
+  completion_rate: number | null;
+  avg_duration_seconds: number | null;
+  avg_final_confidence: number | null;
+}
+
+export interface AnalyticsOverview {
+  sessions_total: number;
+  sessions_completed: number;
+  sessions_failed: number;
+  sessions_cancelled: number;
+  sessions_active: number;
+  success_rate: number | null;
+  avg_duration_seconds: number | null;
+  interventions_total: number;
+  interventions_corrective: number;
+  interventions_per_session: number | null;
+  interventions_by_type: Record<string, number>;
+  avg_confidence: number | null;
+  avg_final_confidence: number | null;
+  confidence_histogram: { label: string; count: number }[];
+  tool_calls: number;
+  tool_failures: number;
+  tool_failure_rate: number | null;
+  tools: ToolStat[];
+  approvals_requested: number;
+  approvals_approved: number;
+  approvals_rejected: number;
+  approval_rate: number | null;
+  conflicts_total: number;
+  conflicts_open: number;
+  sources_used: number;
+  sources_rejected: number;
+  source_rejection_rate: number | null;
+  prediction: RiskSummary;
+  research: {
+    task_completion_rate: number | null;
+    human_correction_rate: number | null;
+    incorrect_actions_per_session: number | null;
+    agent_recovery_rate: number | null;
+    avg_time_to_completion_seconds: number | null;
+    source_rejection_rate: number | null;
+    tool_failure_rate: number | null;
+    conflicts_per_session: number | null;
+    groups: ResearchGroup[];
+    notes: string;
+  };
+  recent_sessions: {
+    id: string;
+    name: string;
+    status: string;
+    created_at: string;
+    duration_seconds: number | null;
+    interventions: number;
+    corrective: number;
+    tool_failures: number;
+    conflicts: number;
+    final_confidence: number | null;
+  }[];
 }
 
 // ---------- Free-text instructions (Phase 12) ----------

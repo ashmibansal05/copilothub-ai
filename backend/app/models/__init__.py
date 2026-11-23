@@ -18,3 +18,5 @@ from app.models.user import User, UserRole  # noqa: F401
 from app.models.intent_sample import IntentSample  # noqa: F401
 from app.models.report import Report  # noqa: F401
 from app.models.tool_execution import ToolExecution  # noqa: F401
+from app.models.analytics_record import AnalyticsRecord  # noqa: F401
+from app.models.risk_prediction import RiskPrediction  # noqa: F401

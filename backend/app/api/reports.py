@@ -1,41 +1,128 @@
+import asyncio
+import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import SessionContext, get_session_context
+from app.agents.runner import agent_runner
+from app.api.deps import SessionContext, get_session_context, require_session_role
+from app.core.config import get_settings
+from app.db import session as db_session
 from app.db.session import get_db
+from app.models.agent import AgentAction
 from app.models.report import Report
+from app.models.user import UserRole
+from app.schemas.auth import MessageResponse
 from app.schemas.tools import ReportDetail, ReportSummary
+from app.services import event_service, report_service
+from app.services.report_export import EXPORTERS, safe_filename
+from app.websocket.events import EventType
 
+logger = logging.getLogger("copilothub.report")
 router = APIRouter(prefix="/sessions", tags=["reports"])
+CanGenerate = Depends(require_session_role(UserRole.OWNER, UserRole.EDITOR))
+_tasks: set[asyncio.Task] = set()
 
 
 def _summary(r: Report) -> ReportSummary:
     return ReportSummary(
-        id=r.id, title=r.title, format=r.format, origin=r.origin, status=r.status,
-        chars=len(r.content), created_at=r.created_at,
+        id=r.id, title=r.title, format=r.format, origin=r.origin, status=r.status, kind=r.kind,
+        engine=r.engine, chars=len(r.content), created_at=r.created_at,
     )
+
+
+def _detail(r: Report) -> ReportDetail:
+    return ReportDetail(**_summary(r).model_dump(), content=r.content, sections=r.sections)
+
+
+def _get(db: Session, ctx: SessionContext, report_id: uuid.UUID) -> Report:
+    report = db.scalar(select(Report).where(Report.id == report_id, Report.session_id == ctx.session.id))
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Report not found")
+    return report
 
 
 @router.get("/{session_id}/reports", response_model=list[ReportSummary])
 async def list_reports(
     ctx: SessionContext = Depends(get_session_context), db: Session = Depends(get_db)
 ) -> list[ReportSummary]:
-    rows = db.scalars(
-        select(Report).where(Report.session_id == ctx.session.id).order_by(Report.created_at)
-    ).all()
+    rows = db.scalars(select(Report).where(Report.session_id == ctx.session.id).order_by(Report.created_at)).all()
     return [_summary(r) for r in rows]
+
+
+@router.get("/{session_id}/report", response_model=ReportDetail)
+async def get_final_report(
+    ctx: SessionContext = Depends(get_session_context), db: Session = Depends(get_db)
+) -> ReportDetail:
+    """The most recent FINAL research report of the session."""
+    report = db.scalar(
+        select(Report).where(Report.session_id == ctx.session.id, Report.kind == "FINAL")
+        .order_by(Report.created_at.desc()).limit(1)
+    )
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No final report has been generated yet")
+    return _detail(report)
+
+
+async def _generate_in_background(session_id: uuid.UUID) -> None:
+    try:
+        brain, _ = await agent_runner.brain_factory()
+        info = await report_service.generate_report(session_id, brain)
+        with db_session.SessionLocal() as db:
+            await event_service.publish(db, session_id, EventType.REPORT_SAVED, {"report": info})
+    except Exception as exc:
+        logger.exception("Report generation failed")
+        with db_session.SessionLocal() as db:
+            await event_service.publish(
+                db, session_id, EventType.AGENT_MESSAGE,
+                {"kind": "warning", "text": f"The report could not be generated ({exc.__class__.__name__})."},
+            )
+
+
+@router.post("/{session_id}/report/generate", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
+async def generate_report(
+    ctx: SessionContext = CanGenerate, db: Session = Depends(get_db)
+) -> MessageResponse:
+    """Build a fresh final report from what the session has produced so far (runs in the background)."""
+    sid = ctx.session.id
+    done = db.scalar(select(func.count()).select_from(AgentAction).where(
+        AgentAction.session_id == sid, AgentAction.action_type == "EVALUATE", AgentAction.success.is_(True))) or 0
+    if done == 0:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Nothing to report yet: no step has been completed")
+    if report_service.is_generating(sid):
+        raise HTTPException(status.HTTP_409_CONFLICT, "A report is already being generated")
+    existing = db.scalar(select(func.count()).select_from(Report).where(Report.session_id == sid, Report.kind == "FINAL")) or 0
+    if existing >= get_settings().max_final_reports_per_session:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"A session can hold at most {get_settings().max_final_reports_per_session} final reports")
+    report_service._generating.add(sid)  # claim it now so a double click cannot start two
+    task = asyncio.create_task(_generate_in_background(sid))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    return MessageResponse(message="Generating the report. It will appear when it is ready.")
 
 
 @router.get("/{session_id}/reports/{report_id}", response_model=ReportDetail)
 async def get_report(
+    report_id: uuid.UUID, ctx: SessionContext = Depends(get_session_context), db: Session = Depends(get_db)
+) -> ReportDetail:
+    return _detail(_get(db, ctx, report_id))
+
+
+@router.get("/{session_id}/reports/{report_id}/download")
+async def download_report(
     report_id: uuid.UUID,
+    format: str = Query("md", pattern="^(md|html|docx)$"),
     ctx: SessionContext = Depends(get_session_context),
     db: Session = Depends(get_db),
-) -> ReportDetail:
-    report = db.scalar(select(Report).where(Report.id == report_id, Report.session_id == ctx.session.id))
-    if report is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Report not found")
-    return ReportDetail(**_summary(report).model_dump(), content=report.content)
+) -> Response:
+    report = _get(db, ctx, report_id)
+    media_type, render = EXPORTERS[format]
+    return Response(
+        content=render(report), media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename(report.title)}.{format}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

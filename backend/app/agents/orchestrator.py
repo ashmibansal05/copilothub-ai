@@ -18,9 +18,10 @@ from app.models.approval import Approval, ApprovalKind, ApprovalStatus
 from app.models.session import AgentSession, AgentStatus
 from app.models.source import Source
 from app.models.tool_execution import ToolExecution
+from app.ml import service as risk_service
 from app.rag import service as rag_service
 from app.rag.embeddings import get_embedder
-from app.services import approval_service, event_service
+from app.services import approval_service, analytics_service, event_service, report_service
 from app.services.conflict_manager import ConflictManager
 from app.services.constraint_manager import ConstraintManager, ConstraintView
 from app.services.memory_manager import MemoryManager
@@ -483,6 +484,7 @@ class AgentOrchestrator:
             "completed_steps": next_index, "progress": progress, "decision": decision,
         })
         await self._save_state(step_index=next_index, progress=progress, confidence=ev.confidence)
+        await self._update_risk()
         return {"confidence": ev.confidence, "step_index": next_index, "retries": retries, "decision": decision}
 
     async def finalize_node(self, state: AgentGraphState) -> dict[str, Any]:
@@ -619,10 +621,12 @@ class AgentOrchestrator:
     # ------------------------------------------------------------------ finishing
     async def _complete(self, final: AgentGraphState) -> None:
         await self._save_state(current_step="Completed", progress=100)
+        await self._generate_final_report()
         if await self._set_status(AgentStatus.COMPLETED, FINISHABLE):
             await self._emit(EventType.COMPLETED, {
                 "summary": final.get("summary", ""), "confidence": final.get("confidence"),
             })
+        await self._record_analytics()
 
     async def _fail(self, error: str) -> None:
         await self._save_state(current_step="Failed")
@@ -636,6 +640,45 @@ class AgentOrchestrator:
         })
         if await self._set_status(AgentStatus.FAILED, FINISHABLE):
             await self._emit(EventType.FAILED, {"error": error})
+        await self._record_analytics()
+
+    # ------------------------------------------------------------------ ML risk, report, analytics (never fatal)
+    async def _update_risk(self) -> None:
+        """Estimate human-intervention risk, persist it, and broadcast an update."""
+        if not self.settings.risk_prediction_enabled:
+            return
+        try:
+            estimate = await asyncio.to_thread(risk_service.estimate_and_store, self.session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Risk estimation failed for session %s", self.session_id, exc_info=True)
+            return
+        if estimate is not None:
+            await self._emit(EventType.RISK_UPDATED, estimate.event_payload())
+
+    async def _generate_final_report(self) -> None:
+        if not self.settings.agent_generate_final_report or self.brain is None:
+            return
+        await self._emit(EventType.AGENT_MESSAGE, {"kind": "system", "text": "Generating the final report..."})
+        try:
+            info = await report_service.generate_report(self.session_id, self.brain)
+            await self._emit(EventType.REPORT_SAVED, {"report": info})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Final report generation failed for session %s", self.session_id)
+            await self._emit(EventType.AGENT_MESSAGE, {
+                "kind": "warning", "text": f"The final report could not be generated ({exc.__class__.__name__}).",
+            })
+
+    async def _record_analytics(self) -> None:
+        try:
+            await asyncio.to_thread(analytics_service.record_session_end, self.session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Could not record analytics for session %s", self.session_id, exc_info=True)
 
     # ------------------------------------------------------------------ human context & sources
     def _human_context_sync(self, query: str) -> HumanContext:

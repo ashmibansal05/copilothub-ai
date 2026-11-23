@@ -1,5 +1,5 @@
 import {
-  Check, Copy, Eye, Hand, Loader2, MessageSquare, Pause, Play, Plus, ShieldPlus, Square, Wifi, WifiOff,
+  BarChart3, Check, Copy, Eye, FileBarChart, Hand, Loader2, MessageSquare, Pause, Play, Plus, ShieldPlus, Square, Wifi, WifiOff,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -11,6 +11,7 @@ import DocumentsPanel from "../components/DocumentsPanel";
 import InstructionBox from "../components/InstructionBox";
 import InstructionConfirmDialog from "../components/InstructionConfirmDialog";
 import ReportsPanel from "../components/ReportsPanel";
+import RiskCard from "../components/RiskCard";
 import EventTimeline from "../components/EventTimeline";
 import InterventionDialog from "../components/InterventionDialog";
 import type { DialogKind } from "../components/InterventionDialog";
@@ -24,11 +25,11 @@ import { getErrorMessage } from "../services/api";
 import { sessionService } from "../services/sessionService";
 import type {
   AgentState, ControlAction, DocumentInfo, InstructionResult, InterventionPayload, MemoryItem,
-  ReportSummary, SessionDetail, SessionEvent,
+  ReportSummary, RiskEstimate, SessionDetail, SessionEvent,
 } from "../types";
 import { applyAgentEvent, emptyAgentState } from "../utils/agentState";
 
-const HIDDEN_IN_TIMELINE = new Set(["TOOL_STARTED", "STEP_COMPLETED", "AGENT_MESSAGE"]);
+const HIDDEN_IN_TIMELINE = new Set(["TOOL_STARTED", "STEP_COMPLETED", "AGENT_MESSAGE", "RISK_UPDATED"]);
 const TERMINAL = ["COMPLETED", "FAILED", "CANCELLED"];
 
 const MESSAGE_STYLES: Record<string, string> = {
@@ -93,6 +94,7 @@ export default function SessionWorkspace() {
   const [memory, setMemory] = useState<MemoryItem[]>([]);
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [reports, setReports] = useState<ReportSummary[]>([]);
+  const [risk, setRisk] = useState<RiskEstimate | null>(null);
   const [pendingInstruction, setPendingInstruction] = useState<InstructionResult | null>(null);
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -131,6 +133,7 @@ export default function SessionWorkspace() {
     sessionService.state(id).then(setAgent).catch(() => undefined);
     sessionService.documents(id).then(setDocuments).catch(() => undefined);
     sessionService.reports(id).then(setReports).catch(() => undefined);
+    sessionService.risk(id).then(setRisk).catch(() => undefined);
   }, [id, loadSession, loadMemory, mergeEvents]);
 
   const handleEvent = useCallback(
@@ -162,6 +165,9 @@ export default function SessionWorkspace() {
       }
       if (e.type === "REPORT_SAVED" && e.payload.report) {
         sessionService.reports(id!).then(setReports).catch(() => undefined);
+      }
+      if (e.type === "RISK_UPDATED") {
+        setRisk({ ...(e.payload as RiskEstimate), available: true });
       }
       setAgent((prev) => (prev ? applyAgentEvent(prev, e) : prev));
       mergeEvents([e]);
@@ -256,6 +262,12 @@ export default function SessionWorkspace() {
           <StatusBadge status={status} />
           <RoleBadge role={role} />
           <ConnectionBadge status={connStatus} />
+          <Link to={`/sessions/${session.id}/report`} className="btn-secondary !py-1 text-xs">
+            <FileBarChart className="h-3.5 w-3.5" /> Report
+          </Link>
+          <Link to={`/sessions/${session.id}/analytics`} className="btn-secondary !py-1 text-xs">
+            <BarChart3 className="h-3.5 w-3.5" /> Analytics
+          </Link>
         </div>
       </div>
 
@@ -297,6 +309,12 @@ export default function SessionWorkspace() {
           </div>
 
           <AgentPanel agent={agentState} status={status} />
+          <RiskCard
+            risk={risk}
+            history={events
+              .filter((e) => e.type === "RISK_UPDATED")
+              .map((e) => e.payload.probability as number)}
+          />
           <ToolActivity
             events={events}
             onRejectSource={canGuide ? (publisher) => quick({ type: "REJECT_SOURCE", target: publisher }) : undefined}

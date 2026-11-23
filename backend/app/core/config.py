@@ -29,7 +29,9 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
 
     # ---- LLM (Phase 6) ----
-    llm_provider: str = "ollama"  # "ollama" | "openai_compatible"
+    llm_provider: str = "ollama"
+    # "ollama" | "openai_compatible"
+
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3"
 
@@ -66,7 +68,9 @@ class Settings(BaseSettings):
     rag_min_score: float = 0.15
     max_upload_mb: int = Field(default=10, ge=1, le=100)
     max_documents_per_session: int = Field(default=20, ge=1, le=200)
-    rag_max_chunks_per_document: int = Field(default=400, ge=1, le=5000)
+    rag_max_chunks_per_document: int = Field(
+        default=400, ge=1, le=5000
+    )
 
     # ---- Tools (Phase 11) ----
     agent_tools_enabled: bool = True
@@ -103,6 +107,24 @@ class Settings(BaseSettings):
 
     nlp_auto_train: bool = True
     # Train on first use when no saved model exists
+
+    # ---- ML Intervention-Risk Predictor (Phase 13) ----
+    risk_prediction_enabled: bool = True
+
+    risk_auto_train: bool = False
+    # False = train explicitly using python -m app.ml.train.
+    # Synthetic training data does not establish real-world accuracy.
+
+    risk_synthetic_rows: int = Field(
+        default=3000, ge=500, le=50000
+    )
+
+    # ---- Final Reports (Phase 14) ----
+    agent_generate_final_report: bool = True
+
+    max_final_reports_per_session: int = Field(
+        default=5, ge=1, le=50
+    )
 
     # ---- Validators ----
 

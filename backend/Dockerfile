@@ -8,10 +8,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Install OpenMP runtime required by ML libraries
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy dependency requirements first for Docker caching
 COPY requirements.txt .
 
-# Install backend and lightweight RAG dependencies
+# Install backend, RAG and ML dependencies
 RUN pip install --timeout 300 --retries 10 -r requirements.txt
 
 # Copy application source code

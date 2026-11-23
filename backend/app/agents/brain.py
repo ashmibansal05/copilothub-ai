@@ -1,3 +1,4 @@
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,7 +12,7 @@ class StepResult:
     output: str
     success: bool = True
     sources: list[dict[str, Any]] = field(default_factory=list)
-    rejected_sources: list[dict[str, Any]] = field(default_factory=list)  # filled by the orchestrator
+    rejected_sources: list[dict[str, Any]] = field(default_factory=list)
     simulated: bool = False
     input: dict[str, Any] = field(default_factory=dict)
 
@@ -24,6 +25,7 @@ class Evaluation:
 
 
 # ---- the tool-use protocol between a brain and the orchestrator ----
+
 @dataclass
 class ToolCall:
     tool: str
@@ -49,48 +51,121 @@ AgentAction = ToolCall | FinalAnswer
 
 
 class AgentBrain(ABC):
-    """The 'thinking' part of the agent. The orchestrator (LangGraph) owns the loop, limits,
-    tool execution, constraint enforcement and events; a brain only decides things.
+    """The 'thinking' part of the agent.
 
-    `constraints` are human rules rendered as text; `notes` are relevant human corrections
-    chosen by the MemoryManager."""
+    The orchestrator (LangGraph) owns the loop, limits,
+    tool execution, constraint enforcement and events;
+    a brain only decides things.
 
-    engine: str  # short id stored in the DB, e.g. "demo" or "ollama:qwen3"
-    description: str  # shown to humans
+    `constraints` are human rules rendered as text.
+    `notes` are relevant human corrections chosen by
+    the MemoryManager.
+    """
+
+    engine: str
+    description: str
     simulated: bool
-    uses_tools: bool = False  # True: the orchestrator runs the tool loop (next_action)
+
+    # True: the orchestrator runs the tool loop (next_action)
+    uses_tools: bool = False
 
     @abstractmethod
     async def make_plan(
-        self, task: str, constraints: list[str], max_steps: int, notes: list[str] | None = None
-    ) -> list[str]: ...
+        self,
+        task: str,
+        constraints: list[str],
+        max_steps: int,
+        notes: list[str] | None = None,
+    ) -> list[str]:
+        ...
 
     @abstractmethod
-    def tool_for_step(self, step: str) -> str: ...
+    def tool_for_step(self, step: str) -> str:
+        ...
 
     @abstractmethod
     async def execute_step(
-        self, task: str, step: str, history: list[dict], constraints: list[str],
-        notes: list[str] | None = None, documents: list[dict] | None = None,
+        self,
+        task: str,
+        step: str,
+        history: list[dict],
+        constraints: list[str],
+        notes: list[str] | None = None,
+        documents: list[dict] | None = None,
     ) -> StepResult:
-        """Single-shot step (no tool loop). Used when AGENT_TOOLS_ENABLED=false."""
+        """Single-shot step (no tool loop).
+
+        Used when AGENT_TOOLS_ENABLED=false.
+        """
 
     async def next_action(
-        self, task: str, step: str, observations: list[ToolObservation], constraints: list[str],
-        notes: list[str] | None = None, tools: list[ToolSpec] | tuple[ToolSpec, ...] = (),
+        self,
+        task: str,
+        step: str,
+        observations: list[ToolObservation],
+        constraints: list[str],
+        notes: list[str] | None = None,
+        tools: list[ToolSpec] | tuple[ToolSpec, ...] = (),
         force_final: bool = False,
     ) -> AgentAction:
-        """Tool-use protocol: return ONE tool call, or the final findings for the step.
-        With force_final=True the brain must return a FinalAnswer."""
-        raise NotImplementedError(f"{type(self).__name__} does not support tools")
+        """Tool-use protocol.
+
+        Return ONE tool call, or the final findings for the step.
+
+        With force_final=True, the brain must return a FinalAnswer.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support tools"
+        )
 
     @abstractmethod
     async def evaluate(
-        self, task: str, step: str, result: StepResult, history: list[dict]
-    ) -> Evaluation: ...
+        self,
+        task: str,
+        step: str,
+        result: StepResult,
+        history: list[dict],
+    ) -> Evaluation:
+        ...
 
     @abstractmethod
     async def summarize(
-        self, task: str, history: list[dict], constraints: list[str] | None = None,
+        self,
+        task: str,
+        history: list[dict],
+        constraints: list[str] | None = None,
         notes: list[str] | None = None,
-    ) -> str: ...
+    ) -> str:
+        ...
+
+    # ---- Final Research Report (Phase 14) ----
+
+    async def write_report(
+        self,
+        task: str,
+        history: list[dict],
+        constraints: list[str] | None = None,
+        notes: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Generate the four narrative sections of the final report.
+
+        Facts such as sources, human decisions, approvals,
+        constraints and other records are assembled separately
+        by the report service from the database.
+
+        Default implementation reuses summarize().
+        """
+
+        summary = await self.summarize(
+            task,
+            history,
+            constraints,
+            notes,
+        )
+
+        return {
+            "executive_summary": summary,
+            "findings": "",
+            "comparison": "",
+            "conclusion": "",
+        }

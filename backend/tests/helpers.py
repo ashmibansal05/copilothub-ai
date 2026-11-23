@@ -107,6 +107,9 @@ class ScriptedBrain(AgentBrain):
     description = "test brain"
     simulated = True
 
+    # Phase 14: optional override for report narrative testing
+    report_text = None
+
     def __init__(
         self,
         steps=5,
@@ -191,6 +194,32 @@ class ScriptedBrain(AgentBrain):
         self.summarize_notes.append(list(notes or []))
         self.summarize_history = history
         return "summary"
+
+    # ============================================================
+    # Phase 14: Final Report Narrative Override
+    # ============================================================
+
+    async def write_report(
+        self,
+        task,
+        history,
+        constraints=None,
+        notes=None,
+    ):
+        if self.report_text is not None:
+            return {
+                "executive_summary": self.report_text,
+                "findings": "",
+                "comparison": "",
+                "conclusion": "",
+            }
+
+        return await super().write_report(
+            task,
+            history,
+            constraints,
+            notes,
+        )
 
     def factory(self):
         async def _factory():
@@ -309,6 +338,8 @@ def wait_ready(
         time.sleep(0.1)
 
     raise AssertionError("document is still processing")
+
+
 class ScriptedToolBrain(AgentBrain):
     """A brain that speaks the tool protocol from a fixed script (one action per call)."""
 
@@ -318,10 +349,10 @@ class ScriptedToolBrain(AgentBrain):
     uses_tools = True
 
     def __init__(self, actions_per_step, final="findings", steps=1):
-        self.actions_per_step = list(actions_per_step)  # tool calls to make, in order
+        self.actions_per_step = list(actions_per_step)
         self.final = final
         self.steps = steps
-        self.seen_observations = []  # observations the brain was shown at each call
+        self.seen_observations = []
         self.force_flags = []
 
     async def make_plan(self, task, constraints, max_steps, notes=None):
@@ -330,11 +361,24 @@ class ScriptedToolBrain(AgentBrain):
     def tool_for_step(self, step):
         return "scripted"
 
-    async def next_action(self, task, step, observations, constraints, notes=None, tools=(), force_final=False):
-        self.seen_observations.append([(o.tool, o.ok, o.output) for o in observations])
+    async def next_action(
+        self,
+        task,
+        step,
+        observations,
+        constraints,
+        notes=None,
+        tools=(),
+        force_final=False,
+    ):
+        self.seen_observations.append(
+            [(o.tool, o.ok, o.output) for o in observations]
+        )
         self.force_flags.append(force_final)
+
         if force_final or len(observations) >= len(self.actions_per_step):
             return FinalAnswer(self.final)
+
         return self.actions_per_step[len(observations)]
 
     async def execute_step(self, *a, **k):

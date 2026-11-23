@@ -29,15 +29,24 @@ class ToolExecutionRead(BaseModel):
     created_at: datetime
 
 
+class ReportSection(BaseModel):
+    key: str
+    title: str
+    body: str
+
+
 class ReportSummary(BaseModel):
     id: uuid.UUID
     title: str
     format: str
     origin: str
     status: str
+    kind: str
+    engine: str | None = None
     chars: int
     created_at: datetime
 
 
 class ReportDetail(ReportSummary):
     content: str
+    sections: list[ReportSection] | None = None
