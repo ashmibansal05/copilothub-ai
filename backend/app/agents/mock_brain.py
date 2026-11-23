@@ -1,6 +1,10 @@
 import asyncio
 
-from app.agents.brain import AgentBrain, Evaluation, StepResult
+from app.agents.brain import (
+    AgentAction, AgentBrain, Evaluation, FinalAnswer, StepResult, ToolCall, ToolObservation,
+)
+from app.tools.base import ToolSpec
+from app.tools.demo_data import demo_sources
 
 CLOUD_PLAN = [
     "Understand the research objective and scope",
@@ -20,48 +24,24 @@ GENERIC_PLAN = [
     "Draft conclusions",
 ]
 
-OFFICIAL = "official documentation"
 
-# Placeholder sources (title, publisher, source_type). Nothing is fetched from the
-# internet; they exist so source constraints can be demonstrated.
-SOURCE_BANK: dict[str, list[tuple[str, str, str]]] = {
-    "aws": [
-        ("Cloud cost tips for founders", "Startup blog", "blog"),
-        ("AWS pricing overview", "Amazon Web Services", OFFICIAL),
-        ("AWS Free Tier summary", "Amazon Web Services", OFFICIAL),
-        ("Amazon Web Services - Wikipedia", "Wikipedia", "encyclopedia"),
-    ],
-    "azure": [
-        ("Azure vs the rest: a founder's view", "Startup blog", "blog"),
-        ("Azure pricing overview", "Microsoft", OFFICIAL),
-        ("Azure for startups summary", "Microsoft", OFFICIAL),
-        ("Microsoft Azure - Wikipedia", "Wikipedia", "encyclopedia"),
-    ],
-    "google": [
-        ("Google Cloud in five minutes", "Startup blog", "blog"),
-        ("Google Cloud pricing overview", "Google Cloud", OFFICIAL),
-        ("Google Cloud free program summary", "Google Cloud", OFFICIAL),
-        ("Google Cloud Platform - Wikipedia", "Wikipedia", "encyclopedia"),
-    ],
-    "criteria": [
-        ("Cloud computing - Wikipedia", "Wikipedia", "encyclopedia"),
-        ("Choosing a cloud provider: startup guide", "Industry blog", "blog"),
-    ],
-    "compare": [("Cloud provider comparison notes", "Analyst blog", "analyst")],
-    "default": [
-        ("Background overview", "Wikipedia", "encyclopedia"),
-        ("Topic explainer", "Industry blog", "blog"),
-    ],
-}
+def _is_cloud_task(task: str) -> bool:
+    lowered = task.lower()
+    return any(k in lowered for k in ("aws", "azure", "google cloud", "cloud platform"))
 
 
 class MockBrain(AgentBrain):
-    """Deterministic demo agent. It does NOT call a model and its tools are
-    SIMULATED. Everything it produces is flagged simulated=True."""
+    """Deterministic demo agent. It does NOT call a language model.
+
+    In tool mode it follows a fixed script of REAL tool calls (search_web uses the
+    simulated demo provider unless you configured another one; retrieve_documents and
+    compare_sources search your uploaded documents). Its notes are written by code, not
+    by a model."""
 
     engine = "demo"
-    description = "demo mode (deterministic, tools are simulated)"
+    description = "demo mode (deterministic script; web results are simulated)"
     simulated = True
+    uses_tools = True
 
     def __init__(self, delay: float = 1.5) -> None:
         self.delay = delay
@@ -72,9 +52,7 @@ class MockBrain(AgentBrain):
 
     async def make_plan(self, task, constraints, max_steps, notes=None) -> list[str]:
         await self._pause()
-        lowered = task.lower()
-        is_cloud = any(k in lowered for k in ("aws", "azure", "google cloud", "cloud platform"))
-        return list((CLOUD_PLAN if is_cloud else GENERIC_PLAN)[:max_steps])
+        return list((CLOUD_PLAN if _is_cloud_task(task) else GENERIC_PLAN)[:max_steps])
 
     def tool_for_step(self, step: str) -> str:
         s = step.lower()
@@ -88,28 +66,39 @@ class MockBrain(AgentBrain):
             return "summarize_document"
         return "read_document"
 
-    def _sources_for(self, step: str) -> list[dict]:
+    # ------------------------------------------------------------- tool mode
+    def _script(self, task: str, step: str) -> list[ToolCall]:
         s = step.lower()
-        if "aws" in s:
-            key = "aws"
-        elif "azure" in s:
-            key = "azure"
-        elif "google" in s:
-            key = "google"
-        elif "criteria" in s or "identify" in s:
-            key = "criteria"
-        elif "compare" in s or "analyse" in s:
-            key = "compare"
-        else:
-            key = "default"
+        if "draft" in s:
+            return []
+        if ("compare" in s or "analyse" in s) and _is_cloud_task(task):
+            return [ToolCall("compare_sources", {
+                "topics": ["AWS", "Azure", "Google Cloud"], "criteria": ["cost", "support"],
+            })]
         return [
-            {"title": t, "publisher": p, "source_type": st, "simulated": True}
-            for t, p, st in SOURCE_BANK[key]
+            ToolCall("search_web", {"query": step[:150]}),
+            ToolCall("retrieve_documents", {"query": f"{task[:100]} {step}"[:250]}),
         ]
 
+    async def next_action(
+        self, task, step, observations: list[ToolObservation], constraints, notes=None,
+        tools: list[ToolSpec] | tuple[ToolSpec, ...] = (), force_final=False,
+    ) -> AgentAction:
+        await self._pause()
+        script = self._script(task, step)
+        if force_final or len(observations) >= len(script):
+            used = ", ".join(dict.fromkeys(o.tool for o in observations)) or "no tools"
+            ok = sum(1 for o in observations if o.ok)
+            return FinalAnswer(
+                f"Step '{step}' completed using {used} ({ok}/{len(observations)} calls succeeded). "
+                "This note was written by the demo script, not by a language model."
+            )
+        return script[len(observations)]
+
+    # ------------------------------------------------------------- single-shot mode
     async def execute_step(self, task, step, history, constraints, notes=None, documents=None) -> StepResult:
         await self._pause()
-        sources = self._sources_for(step)
+        sources = demo_sources(step)
         extra = f" It also received {len(documents)} passage(s) from uploaded documents." if documents else ""
         return StepResult(
             tool=self.tool_for_step(step),
@@ -141,7 +130,7 @@ class MockBrain(AgentBrain):
         parts = [
             "[Demo mode] This is a placeholder summary produced without a language model.",
             f"Steps completed:\n{steps}",
-            "Sources used (simulated):\n" + ("\n".join(source_lines) or "- none"),
+            "Sources used:\n" + ("\n".join(source_lines) or "- none"),
         ]
         if constraints:
             parts.append("Human constraints in force:\n" + "\n".join(f"- {c}" for c in constraints))

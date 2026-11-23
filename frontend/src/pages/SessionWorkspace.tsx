@@ -8,6 +8,9 @@ import ApprovalCard from "../components/ApprovalCard";
 import ConflictCard from "../components/ConflictCard";
 import ConstraintsPanel from "../components/ConstraintsPanel";
 import DocumentsPanel from "../components/DocumentsPanel";
+import InstructionBox from "../components/InstructionBox";
+import InstructionConfirmDialog from "../components/InstructionConfirmDialog";
+import ReportsPanel from "../components/ReportsPanel";
 import EventTimeline from "../components/EventTimeline";
 import InterventionDialog from "../components/InterventionDialog";
 import type { DialogKind } from "../components/InterventionDialog";
@@ -20,7 +23,8 @@ import type { ConnectionStatus } from "../hooks/useSessionSocket";
 import { getErrorMessage } from "../services/api";
 import { sessionService } from "../services/sessionService";
 import type {
-  AgentState, ControlAction, DocumentInfo, InterventionPayload, MemoryItem, SessionDetail, SessionEvent,
+  AgentState, ControlAction, DocumentInfo, InstructionResult, InterventionPayload, MemoryItem,
+  ReportSummary, SessionDetail, SessionEvent,
 } from "../types";
 import { applyAgentEvent, emptyAgentState } from "../utils/agentState";
 
@@ -88,6 +92,8 @@ export default function SessionWorkspace() {
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [memory, setMemory] = useState<MemoryItem[]>([]);
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
+  const [reports, setReports] = useState<ReportSummary[]>([]);
+  const [pendingInstruction, setPendingInstruction] = useState<InstructionResult | null>(null);
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -124,6 +130,7 @@ export default function SessionWorkspace() {
     sessionService.events(id).then(mergeEvents).catch(() => undefined);
     sessionService.state(id).then(setAgent).catch(() => undefined);
     sessionService.documents(id).then(setDocuments).catch(() => undefined);
+    sessionService.reports(id).then(setReports).catch(() => undefined);
   }, [id, loadSession, loadMemory, mergeEvents]);
 
   const handleEvent = useCallback(
@@ -153,10 +160,13 @@ export default function SessionWorkspace() {
       if (e.type === "DOCUMENT_REMOVED") {
         setDocuments((prev) => prev.filter((d) => d.id !== e.payload.document_id));
       }
+      if (e.type === "REPORT_SAVED" && e.payload.report) {
+        sessionService.reports(id!).then(setReports).catch(() => undefined);
+      }
       setAgent((prev) => (prev ? applyAgentEvent(prev, e) : prev));
       mergeEvents([e]);
     },
-    [loadSession, loadMemory, mergeEvents]
+    [id, loadSession, loadMemory, mergeEvents]
   );
 
   const { status: connStatus, online } = useSessionSocket(id, handleEvent);
@@ -221,6 +231,18 @@ export default function SessionWorkspace() {
           initialText={dialog === "MODIFY_TASK" ? session.task : ""}
           onClose={() => setDialog(null)}
           onSubmit={submitDialog}
+        />
+      )}
+
+      {pendingInstruction && (
+        <InstructionConfirmDialog
+          result={pendingInstruction}
+          constraints={agentState.active_constraints}
+          role={role}
+          onClose={() => setPendingInstruction(null)}
+          onConfirm={async (payload) => {
+            await sessionService.intervene(id!, payload);
+          }}
         />
       )}
 
@@ -328,6 +350,8 @@ export default function SessionWorkspace() {
             onPreview={(docId) => sessionService.documentChunks(id!, docId)}
           />
 
+          <ReportsPanel reports={reports} onOpen={(rid) => sessionService.report(id!, rid)} />
+
           <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="mb-3 font-semibold">Collaborators ({session.members.length})</h2>
             <ul className="space-y-3">
@@ -368,6 +392,12 @@ export default function SessionWorkspace() {
         )}
         {role !== "VIEWER" && (
           <>
+            {canGuide && (
+              <InstructionBox
+                onSubmit={(text) => sessionService.instruct(id!, text)}
+                onNeedsConfirmation={setPendingInstruction}
+              />
+            )}
             <div className="flex flex-wrap items-center gap-2">
               <button className="btn-secondary" onClick={() => setDialog("COMMENT")}>
                 <MessageSquare className="h-4 w-4" /> Comment

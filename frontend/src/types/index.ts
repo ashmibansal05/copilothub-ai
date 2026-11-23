@@ -171,6 +171,7 @@ export interface InterventionPayload {
   priority?: Priority;
   action?: ConstraintAction;
   constraint_id?: string;
+  origin_text?: string;
 }
 
 export interface AgentState {
@@ -260,4 +261,46 @@ export interface SearchHit {
   text: string;
   score: number;
   preferred: boolean;
+}
+// ---------- Reports (Phase 11) ----------
+
+export interface ReportSummary {
+  id: string;
+  title: string;
+  format: string;
+  origin: string;
+  status: string;
+  chars: number;
+  created_at: string;
+}
+
+export interface ReportDetail extends ReportSummary {
+  content: string;
+}
+
+// ---------- Free-text instructions (Phase 12) ----------
+
+export interface InstructionProposal {
+  type: InterventionType;
+  content: string | null;
+  target: string | null;
+  action: ConstraintAction | null;
+  priority: Priority | null;
+  constraint_id: string | null;
+  candidates: { id: string; description: string }[];
+}
+
+export interface InstructionResult {
+  text: string;
+  intent: string;
+  confidence: number;
+  method: "model" | "rule";
+  alternatives: { intent: string; confidence: number }[];
+  proposal: InstructionProposal;
+  allowed: boolean;
+  needs_confirmation: boolean;
+  reason: string | null;
+  note: string | null;
+  applied: boolean;
+  intervention: Intervention | null;
 }

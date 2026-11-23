@@ -15,3 +15,6 @@ from app.models.memory import MemoryItem, MemoryKind  # noqa: F401
 from app.models.session import AgentSession, AgentStatus, SessionMember  # noqa: F401
 from app.models.source import Source  # noqa: F401
 from app.models.user import User, UserRole  # noqa: F401
+from app.models.intent_sample import IntentSample  # noqa: F401
+from app.models.report import Report  # noqa: F401
+from app.models.tool_execution import ToolExecution  # noqa: F401

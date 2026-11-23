@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 
-from app.agents.brain import AgentBrain, StepResult
+from app.agents.brain import AgentBrain, FinalAnswer, StepResult, ToolCall, ToolObservation
 from app.agents.state import AgentGraphState, ApprovalDecision, HumanContext
 from app.core.config import Settings, get_settings
 from app.db import session as db_session
@@ -17,12 +17,16 @@ from app.models.agent import AgentAction, AgentState
 from app.models.approval import Approval, ApprovalKind, ApprovalStatus
 from app.models.session import AgentSession, AgentStatus
 from app.models.source import Source
+from app.models.tool_execution import ToolExecution
 from app.rag import service as rag_service
 from app.rag.embeddings import get_embedder
 from app.services import approval_service, event_service
 from app.services.conflict_manager import ConflictManager
 from app.services.constraint_manager import ConstraintManager, ConstraintView
 from app.services.memory_manager import MemoryManager
+from app.tools import get_registry
+from app.tools.base import ToolContext
+from app.tools.registry import ToolOutcome, ToolRegistry, preview_arguments
 from app.websocket.events import EventType
 
 logger = logging.getLogger("copilothub.agent")
@@ -61,9 +65,12 @@ class AgentOrchestrator:
         session_id: uuid.UUID,
         brain_factory: BrainFactory,
         settings: Settings | None = None,
+        tools: ToolRegistry | None = None,
     ) -> None:
         self.session_id = session_id
         self.settings = settings or get_settings()
+        self.tools = tools or get_registry()
+        self._tool_calls_total = 0
         self.brain_factory = brain_factory
         self.brain: AgentBrain | None = None
         self.resume_event = asyncio.Event()
@@ -227,19 +234,132 @@ class AgentOrchestrator:
         assert self.brain is not None
         i, plan = state["step_index"], state["plan"]
         n, step = len(plan), plan[i]
-        tool = self.brain.tool_for_step(step)
         progress = self._progress(i, n)
         query = f"{state['task']} {step}"
         ctx = await self._human_context(query)
-
-        # Retrieval already skips excluded sources; the filter below is a second line of defence.
-        chunks = await self._retrieve_documents(query, await self._active_views())
-        documents = [c.as_prompt() for c in chunks]
 
         await self._save_state(current_step=step, progress=progress)
         await self._emit(EventType.STEP_STARTED, {
             "phase": "ACT", "step_index": i + 1, "total_steps": n, "step": step, "progress": progress,
         })
+
+        started = time.monotonic()
+        if self.settings.agent_tools_enabled and self.brain.uses_tools:
+            result = await self._act_with_tools(state, step, i, ctx)
+        else:
+            result = await self._act_single_shot(state, step, i, ctx, query)
+
+        await self._record_action(
+            i + 1, "TOOL_CALL", result.tool[:60], {"step": step},
+            {"output": result.output[:2000], "sources": result.sources,
+             "rejected_sources": result.rejected_sources},
+            result.success, None, self._ms(started),
+        )
+        await self._record_sources(i + 1, result)
+        return {"last_result": asdict(result), "steps_executed": state.get("steps_executed", 0) + 1}
+
+    # ------------------------------------------------------------------ tool loop (Phase 11)
+    async def _act_with_tools(self, state: AgentGraphState, step: str, i: int, ctx: HumanContext) -> StepResult:
+        """The model asks for tools; WE validate and run them; results go back to the model.
+        Bounded by max calls per step and per run."""
+        assert self.brain is not None
+        specs = self.tools.specs()
+        observations: list[ToolObservation] = []
+        used: list[str] = []
+        sources: list[dict] = []
+        rejected: list[dict] = []
+        simulated = bool(self.brain.simulated)
+        per_step = self.settings.agent_max_tool_calls_per_step
+        final_text = ""
+
+        for call_number in range(per_step + 1):
+            force = (
+                call_number >= per_step
+                or self._tool_calls_total >= self.settings.agent_max_tool_calls_per_run
+            )
+            action = await self._attempt(
+                "ACT",
+                lambda force=force: self.brain.next_action(
+                    state["task"], step, list(observations), ctx.constraints,
+                    notes=ctx.notes, tools=specs, force_final=force,
+                ),
+                step_index=i + 1, tool_name="llm_reasoning",
+            )
+            if isinstance(action, FinalAnswer):
+                final_text = action.text
+                break
+            if force:  # defensive: the brain ignored force_final
+                final_text = "(No final answer was produced within the tool-call limit.)"
+                break
+            outcome = await self._execute_tool(action, state, i + 1)
+            observations.append(ToolObservation(
+                tool=action.tool, arguments=action.arguments, ok=outcome.ok, output=outcome.output
+            ))
+            used.append(action.tool)
+            sources += outcome.sources
+            rejected += outcome.rejected_sources
+            simulated = simulated or outcome.simulated
+
+        if rejected:
+            names = sorted({s.get("rejected_by", "?") for s in rejected})
+            await self._emit(EventType.AGENT_MESSAGE, {
+                "kind": "constraint",
+                "text": f"Step {i + 1}: filtered {len(rejected)} source(s) because of human constraints ({', '.join(names)}).",
+            })
+        return StepResult(
+            tool="+".join(dict.fromkeys(used)) or "llm_reasoning",
+            output=final_text, success=True,
+            sources=self._dedupe_sources(sources), rejected_sources=self._dedupe_sources(rejected),
+            simulated=simulated, input={"step": step},
+        )
+
+    async def _execute_tool(self, call: ToolCall, state: AgentGraphState, step_index: int) -> ToolOutcome:
+        self._tool_calls_total += 1
+        tool_context = ToolContext(
+            session_id=self.session_id, settings=self.settings, views=await self._active_views(),
+            step_index=step_index, task=state["task"], history=list(state.get("observations", [])),
+        )
+        preview = preview_arguments(call.arguments)
+        await self._emit(EventType.TOOL_STARTED, {
+            "tool": str(call.tool)[:60], "step_index": step_index, "input": preview, "simulated": False,
+        })
+        outcome = await self.tools.execute(call.tool, call.arguments, tool_context)
+        await self._record_tool_execution(step_index, outcome)
+        await self._emit(EventType.TOOL_COMPLETED, {
+            "tool": outcome.tool, "step_index": step_index, "success": outcome.ok,
+            "status": outcome.status, "duration_ms": outcome.duration_ms,
+            "output": outcome.output[:500], "arguments": outcome.arguments,
+            "sources": outcome.sources, "rejected_sources": outcome.rejected_sources,
+            "retrieved_chunks": outcome.retrieved_chunks, "simulated": outcome.simulated,
+            "error": outcome.error,
+        })
+        if outcome.ok and outcome.tool == "save_report":
+            await self._emit(EventType.REPORT_SAVED, {"report": outcome.data})
+        return outcome
+
+    async def _record_tool_execution(self, step_index: int, outcome: ToolOutcome) -> None:
+        try:
+            with self._db() as db:
+                db.add(ToolExecution(
+                    session_id=self.session_id, step_index=step_index, tool_name=outcome.tool,
+                    arguments=outcome.arguments, status=outcome.status,
+                    output_summary=outcome.output[:500] if outcome.ok else None, error=outcome.error,
+                    simulated=outcome.simulated, duration_ms=outcome.duration_ms,
+                    sources_count=len(outcome.sources), rejected_count=len(outcome.rejected_sources),
+                ))
+                db.commit()
+        except Exception:
+            logger.warning("Could not record tool execution for session %s", self.session_id, exc_info=True)
+
+    # ------------------------------------------------------------------ single-shot step (Phase 5-10 behaviour)
+    async def _act_single_shot(
+        self, state: AgentGraphState, step: str, i: int, ctx: HumanContext, query: str
+    ) -> StepResult:
+        assert self.brain is not None
+        tool = self.brain.tool_for_step(step)
+        # Retrieval already skips excluded sources; the filter below is a second line of defence.
+        chunks = await self._retrieve_documents(query, await self._active_views())
+        documents = [c.as_prompt() for c in chunks]
         await self._emit(EventType.TOOL_STARTED, {
             "tool": tool, "step_index": i + 1, "input": {"step": step}, "simulated": self.brain.simulated,
         })
@@ -255,8 +375,7 @@ class AgentOrchestrator:
         )
         result.sources = list(result.sources) + self._document_sources(chunks)
 
-        # Enforcement point: whatever the brain returned, the CURRENT human rules decide
-        # which sources the agent may keep (rules may have changed during the call).
+        # Enforcement point: the CURRENT human rules decide which sources the agent may keep.
         views = await self._active_views()
         result.sources, result.rejected_sources = ConstraintManager.filter_sources(views, result.sources)
         if result.rejected_sources:
@@ -265,22 +384,24 @@ class AgentOrchestrator:
                 "kind": "constraint",
                 "text": f"Step {i + 1}: filtered {len(result.rejected_sources)} source(s) because of human constraints ({', '.join(names)}).",
             })
-
-        duration = self._ms(started)
-        await self._record_action(
-            i + 1, "TOOL_CALL", result.tool, {"step": step},
-            {"output": result.output[:2000], "sources": result.sources,
-             "rejected_sources": result.rejected_sources, "retrieved_chunks": len(chunks)},
-            result.success, None, duration,
-        )
-        await self._record_sources(i + 1, result)
         await self._emit(EventType.TOOL_COMPLETED, {
-            "tool": result.tool, "step_index": i + 1, "success": result.success,
-            "duration_ms": duration, "output": result.output[:500],
+            "tool": result.tool, "step_index": i + 1, "success": result.success, "status": "SUCCESS",
+            "duration_ms": self._ms(started), "output": result.output[:500],
             "sources": result.sources, "rejected_sources": result.rejected_sources,
             "retrieved_chunks": len(chunks), "simulated": result.simulated,
         })
-        return {"last_result": asdict(result), "steps_executed": state.get("steps_executed", 0) + 1}
+        return result
+
+    @staticmethod
+    def _dedupe_sources(sources: list[dict]) -> list[dict]:
+        seen: set[tuple] = set()
+        out = []
+        for s in sources:
+            key = (s.get("title"), s.get("publisher"), s.get("document_id") or s.get("url"))
+            if key not in seen:
+                seen.add(key)
+                out.append(s)
+        return out
 
     async def observe_node(self, state: AgentGraphState) -> dict[str, Any]:
         i, plan = state["step_index"], state["plan"]
@@ -552,21 +673,15 @@ class AgentOrchestrator:
 
     @staticmethod
     def _document_sources(chunks) -> list[dict]:
-        by_doc: dict[uuid.UUID, dict] = {}
-        for c in chunks:
-            entry = by_doc.get(c.document_id)
-            if entry is None or c.score > entry["score"]:
-                by_doc[c.document_id] = {
-                    "title": c.title, "publisher": c.source_name, "source_type": c.source_type,
-                    "document_id": str(c.document_id), "origin": "document", "simulated": False,
-                    "score": round(c.score, 3), "page": c.page, "excerpt": c.text[:160],
-                }
-        return list(by_doc.values())
+        return rag_service.document_sources(chunks)
 
     async def _record_sources(self, step_index: int, result: StepResult) -> None:
         def row(source: dict, status: str) -> Source:
-            origin = "DOCUMENT" if source.get("origin") == "document" else (
-                "SIMULATED" if source.get("simulated") else "OTHER")
+            origin = (
+                "DOCUMENT" if source.get("origin") == "document"
+                else "WEB" if source.get("origin") == "web"
+                else "SIMULATED" if source.get("simulated") else "OTHER"
+            )
             document_id = uuid.UUID(source["document_id"]) if source.get("document_id") else None
             return Source(
                 session_id=self.session_id, document_id=document_id, step_index=step_index,

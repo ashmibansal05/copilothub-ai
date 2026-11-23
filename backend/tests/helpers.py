@@ -6,7 +6,7 @@ import uuid
 
 from app.agents.brain import AgentBrain, Evaluation, StepResult
 from app.models.session import AgentSession, AgentStatus
-
+from app.agents.brain import FinalAnswer, ToolCall
 
 PASSWORD = "StrongPass123"
 
@@ -309,3 +309,45 @@ def wait_ready(
         time.sleep(0.1)
 
     raise AssertionError("document is still processing")
+class ScriptedToolBrain(AgentBrain):
+    """A brain that speaks the tool protocol from a fixed script (one action per call)."""
+
+    engine = "scripted-tools"
+    description = "scripted tool brain"
+    simulated = True
+    uses_tools = True
+
+    def __init__(self, actions_per_step, final="findings", steps=1):
+        self.actions_per_step = list(actions_per_step)  # tool calls to make, in order
+        self.final = final
+        self.steps = steps
+        self.seen_observations = []  # observations the brain was shown at each call
+        self.force_flags = []
+
+    async def make_plan(self, task, constraints, max_steps, notes=None):
+        return [f"step {i + 1}" for i in range(self.steps)]
+
+    def tool_for_step(self, step):
+        return "scripted"
+
+    async def next_action(self, task, step, observations, constraints, notes=None, tools=(), force_final=False):
+        self.seen_observations.append([(o.tool, o.ok, o.output) for o in observations])
+        self.force_flags.append(force_final)
+        if force_final or len(observations) >= len(self.actions_per_step):
+            return FinalAnswer(self.final)
+        return self.actions_per_step[len(observations)]
+
+    async def execute_step(self, *a, **k):
+        raise AssertionError("single-shot path must not be used in tool mode")
+
+    async def evaluate(self, task, step, result, history):
+        return Evaluation(confidence=0.8, ok=True)
+
+    async def summarize(self, task, history, constraints=None, notes=None):
+        return "summary"
+
+    def factory(self):
+        async def _factory():
+            return self, None
+
+        return _factory

@@ -1,3 +1,4 @@
+
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -22,6 +23,11 @@ class InterventionCreate(BaseModel):
     conflict_id: uuid.UUID | None = None  # for RESOLVE_CONFLICT
     winner_constraint_id: uuid.UUID | None = None  # for RESOLVE_CONFLICT (null = remove both)
 
+    # Phase 12: NLP intervention classifier
+    # Preserve the original natural-language instruction for auditing
+    # and classifier feedback.
+    origin_text: str | None = Field(default=None, max_length=1000)
+
 
 class InterventionRead(BaseModel):
     id: uuid.UUID
@@ -44,6 +50,9 @@ class ConstraintCreate(BaseModel):
     action: ConstraintAction
     target: str = Field(min_length=2, max_length=300)
     priority: Priority = Priority.MEDIUM
+
+    # Phase 12: Original free-text instruction
+    origin_text: str | None = Field(default=None, max_length=1000)
 
 
 class ConstraintRead(BaseModel):

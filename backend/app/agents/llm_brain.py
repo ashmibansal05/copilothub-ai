@@ -1,5 +1,15 @@
-from app.agents.brain import AgentBrain, Evaluation, StepResult
 
+import json
+
+from app.agents.brain import (
+    AgentAction,
+    AgentBrain,
+    Evaluation,
+    FinalAnswer,
+    StepResult,
+    ToolCall,
+    ToolObservation,
+)
 from app.agents.prompts import (
     EVALUATE_INSTRUCTION,
     EXECUTE_INSTRUCTION,
@@ -7,11 +17,12 @@ from app.agents.prompts import (
     PLAN_INSTRUCTION,
     SUMMARY_INSTRUCTION,
     build_messages,
+    build_tool_messages,
     fence,
 )
-
 from app.llm.base import LLMProvider, LLMResponseError
 from app.llm.utils import extract_json
+from app.tools.base import ToolSpec, describe_tools
 
 
 def _as_text(item: object) -> str:
@@ -23,43 +34,101 @@ def _as_text(item: object) -> str:
 
 
 def _history_snippets(history: list[dict], limit: int = 5) -> list[str]:
-    return [f"Step {h['step_index']} ({h['step']}): {h['finding'][:300]}" for h in history[-limit:]]
+    return [
+        f"Step {h['step_index']} ({h['step']}): {h['finding'][:300]}"
+        for h in history[-limit:]
+    ]
 
 
 class LLMBrain(AgentBrain):
-    """Real model reasoning through an LLMProvider. No retrieval or tools yet
-    (Phases 10-11), so findings come from the model's own knowledge."""
+    """Real model reasoning through an LLMProvider.
+
+    Supports both the existing single-shot execution mode and
+    Phase 11 controlled tool execution.
+    """
 
     simulated = False
+    uses_tools = True
 
     def __init__(self, provider: LLMProvider) -> None:
         self.provider = provider
         self.engine = f"{provider.name}:{provider.model}"
-        self.description = f"{provider.name} / {provider.model} (model knowledge only, no retrieval yet)"
-
-    async def make_plan(self, task, constraints, max_steps, notes=None) -> list[str]:
-        messages = build_messages(
-            task, PLAN_INSTRUCTION.format(max_steps=max_steps), constraints, human_notes=notes
+        self.description = (
+            f"{provider.name} / {provider.model} "
+            "(LLM reasoning with controlled tools and document retrieval)"
         )
-        raw = await self.provider.generate(messages, json_mode=True, max_tokens=500)
+
+    async def make_plan(
+        self,
+        task,
+        constraints,
+        max_steps,
+        notes=None,
+    ) -> list[str]:
+        messages = build_messages(
+            task,
+            PLAN_INSTRUCTION.format(max_steps=max_steps),
+            constraints,
+            human_notes=notes,
+        )
+
+        raw = await self.provider.generate(
+            messages,
+            json_mode=True,
+            max_tokens=500,
+        )
+
         data = extract_json(raw)
+
         steps = data.get("steps") if isinstance(data, dict) else data
+
         if not isinstance(steps, list):
             raise LLMResponseError("Plan JSON has no 'steps' list")
-        cleaned = [_as_text(s).strip()[:200] for s in steps if _as_text(s).strip()]
+
+        cleaned = [
+            _as_text(s).strip()[:200]
+            for s in steps
+            if _as_text(s).strip()
+        ]
+
         if not cleaned:
             raise LLMResponseError("The model produced an empty plan")
+
         return cleaned[:max_steps]
 
     def tool_for_step(self, step: str) -> str:
         return "llm_reasoning"
 
-    async def execute_step(self, task, step, history, constraints, notes=None, documents=None) -> StepResult:
+    async def execute_step(
+        self,
+        task,
+        step,
+        history,
+        constraints,
+        notes=None,
+        documents=None,
+    ) -> StepResult:
+        """Existing single-shot execution mode.
+
+        This method is retained for compatibility with the earlier
+        agent workflow when AGENT_TOOLS_ENABLED=false.
+        """
+
         passages = [
-            f"[{i}] {d['title']} ({d['source_name']}" + (f", page {d['page']}" if d.get("page") else "") + f")\n{d['text']}"
+            (
+                f"[{i}] {d['title']} ({d['source_name']}"
+                + (f", page {d['page']}" if d.get("page") else "")
+                + f")\n{d['text']}"
+            )
             for i, d in enumerate(documents or [], start=1)
         ]
-        template = EXECUTE_WITH_DOCS_INSTRUCTION if passages else EXECUTE_INSTRUCTION
+
+        template = (
+            EXECUTE_WITH_DOCS_INSTRUCTION
+            if passages
+            else EXECUTE_INSTRUCTION
+        )
+
         messages = build_messages(
             task,
             template.format(step=fence(step)),
@@ -68,33 +137,204 @@ class LLMBrain(AgentBrain):
             tool_results=_history_snippets(history),
             human_notes=notes,
         )
-        text = await self.provider.generate(messages, max_tokens=400)
-        return StepResult(tool="llm_reasoning", output=text, simulated=False, input={"step": step})
 
+        text = await self.provider.generate(
+            messages,
+            max_tokens=400,
+        )
 
-    async def evaluate(self, task, step, result, history) -> Evaluation:
+        return StepResult(
+            tool="llm_reasoning",
+            output=text,
+            simulated=False,
+            input={"step": step},
+        )
+
+    # ============================================================
+    # Phase 11 — Controlled Tool Execution
+    # ============================================================
+
+    async def next_action(
+        self,
+        task,
+        step,
+        observations: list[ToolObservation],
+        constraints,
+        notes=None,
+        tools: list[ToolSpec] | tuple[ToolSpec, ...] = (),
+        force_final=False,
+    ) -> AgentAction:
+        """Ask the LLM to select an approved tool or provide final findings.
+
+        The orchestrator remains responsible for validating and
+        executing tool calls. The LLM cannot execute tools directly.
+        """
+
+        seen = [
+            (
+                f"Call {i}: "
+                f"{o.tool}({json.dumps(o.arguments, default=str)[:200]}) "
+                f"-> {'OK' if o.ok else 'FAILED'}\n"
+                f"{o.output[:1200]}"
+            )
+            for i, o in enumerate(
+                observations[-4:],
+                start=max(1, len(observations) - 3),
+            )
+        ]
+
+        messages = build_tool_messages(
+            task,
+            step,
+            describe_tools(tools),
+            constraints,
+            notes,
+            seen,
+            force_final,
+        )
+
+        raw = await self.provider.generate(
+            messages,
+            json_mode=True,
+            max_tokens=500,
+        )
+
+        try:
+            data = extract_json(raw)
+
+        except LLMResponseError:
+            # Small models sometimes respond in plain text.
+            # Accept a sufficiently long prose response as final findings,
+            # but never treat incomplete JSON as a final answer.
+            text = raw.strip()
+
+            if len(text) >= 30 and not text.startswith(("{", "[")):
+                return FinalAnswer(text[:1500])
+
+            raise
+
+        if not isinstance(data, dict):
+            raise LLMResponseError(
+                "The reply is not a JSON object"
+            )
+
+        action = str(data.get("action", "")).lower()
+
+        if action == "final":
+            text = (
+                data.get("findings")
+                or data.get("answer")
+                or data.get("final")
+            )
+
+            if not isinstance(text, str) or not text.strip():
+                raise LLMResponseError(
+                    "The final reply has no findings"
+                )
+
+            return FinalAnswer(
+                text.strip()[:1500]
+            )
+
+        if action == "tool":
+            if force_final:
+                raise LLMResponseError(
+                    "The model called a tool although it had to answer now"
+                )
+
+            tool = data.get("tool")
+            arguments = data.get("arguments", {})
+
+            if not isinstance(tool, str) or not tool:
+                raise LLMResponseError(
+                    "The tool call has no tool name"
+                )
+
+            return ToolCall(
+                tool=tool,
+                arguments=(
+                    arguments
+                    if isinstance(arguments, dict)
+                    else {}
+                ),
+            )
+
+        raise LLMResponseError(
+            "The reply has no valid 'action'"
+        )
+
+    async def evaluate(
+        self,
+        task,
+        step,
+        result,
+        history,
+    ) -> Evaluation:
         messages = build_messages(
             task,
-            EVALUATE_INSTRUCTION.format(step=fence(step)),
+            EVALUATE_INSTRUCTION.format(
+                step=fence(step)
+            ),
             tool_results=[result.output[:1500]],
         )
-        raw = await self.provider.generate(messages, json_mode=True, max_tokens=200)
+
+        raw = await self.provider.generate(
+            messages,
+            json_mode=True,
+            max_tokens=200,
+        )
+
         data = extract_json(raw)
+
         if not isinstance(data, dict) or "confidence" not in data:
-            raise LLMResponseError("Evaluation JSON has no 'confidence'")
+            raise LLMResponseError(
+                "Evaluation JSON has no 'confidence'"
+            )
+
         try:
             confidence = float(data["confidence"])
         except (TypeError, ValueError) as exc:
-            raise LLMResponseError("Evaluation confidence is not a number") from exc
-        if 10.0 < confidence <= 100.0:  # model answered as a percentage
-            confidence /= 100.0
-        confidence = max(0.0, min(1.0, confidence))
-        ok = bool(data.get("ok", confidence >= 0.4))
-        return Evaluation(confidence=round(confidence, 2), ok=ok, note=str(data.get("note", ""))[:200])
+            raise LLMResponseError(
+                "Evaluation confidence is not a number"
+            ) from exc
 
-    async def summarize(self, task, history, constraints=None, notes=None) -> str:
-        messages = build_messages(
-            task, SUMMARY_INSTRUCTION, constraints,
-            tool_results=_history_snippets(history, limit=12), human_notes=notes,
+        if 10.0 < confidence <= 100.0:
+            confidence /= 100.0
+
+        confidence = max(
+            0.0,
+            min(1.0, confidence),
         )
-        return await self.provider.generate(messages, max_tokens=500)
+
+        ok = bool(
+            data.get("ok", confidence >= 0.4)
+        )
+
+        return Evaluation(
+            confidence=round(confidence, 2),
+            ok=ok,
+            note=str(data.get("note", ""))[:200],
+        )
+
+    async def summarize(
+        self,
+        task,
+        history,
+        constraints=None,
+        notes=None,
+    ) -> str:
+        messages = build_messages(
+            task,
+            SUMMARY_INSTRUCTION,
+            constraints,
+            tool_results=_history_snippets(
+                history,
+                limit=12,
+            ),
+            human_notes=notes,
+        )
+
+        return await self.provider.generate(
+            messages,
+            max_tokens=500,
+        )

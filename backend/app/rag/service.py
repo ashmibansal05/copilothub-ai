@@ -233,3 +233,15 @@ def retrieve_chunks(
         ))
     results.sort(key=lambda r: r.score, reverse=True)
     return results[:k]
+def document_sources(chunks: list[RetrievedChunk]) -> list[dict]:
+    """One source entry per document, with its best score, in the shape constraints understand."""
+    by_doc: dict[uuid.UUID, dict] = {}
+    for c in chunks:
+        entry = by_doc.get(c.document_id)
+        if entry is None or c.score > entry["score"]:
+            by_doc[c.document_id] = {
+                "title": c.title, "publisher": c.source_name, "source_type": c.source_type,
+                "document_id": str(c.document_id), "origin": "document", "simulated": False,
+                "score": round(c.score, 3), "page": c.page, "excerpt": c.text[:160],
+            }
+    return list(by_doc.values())

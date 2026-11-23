@@ -14,6 +14,9 @@ import type {
   ChunkInfo,
   DocumentInfo,
   SearchHit,
+  InstructionResult,
+  ReportDetail,
+  ReportSummary,
 } from "../types";
 
 export const sessionService = {
@@ -32,7 +35,9 @@ export const sessionService = {
 
   preview: (code: string) =>
     api
-      .get<InvitePreview>(`/sessions/invite/${encodeURIComponent(code)}`)
+      .get<InvitePreview>(
+        `/sessions/invite/${encodeURIComponent(code)}`
+      )
       .then((r) => r.data),
 
   join: (code: string) =>
@@ -135,5 +140,31 @@ export const sessionService = {
         query,
         k: 5,
       })
+      .then((r) => r.data),
+
+  // ============================================================
+  // Phase 11: Saved Reports
+  // ============================================================
+
+  reports: (id: string) =>
+    api
+      .get<ReportSummary[]>(`/sessions/${id}/reports`)
+      .then((r) => r.data),
+
+  report: (id: string, reportId: string) =>
+    api
+      .get<ReportDetail>(`/sessions/${id}/reports/${reportId}`)
+      .then((r) => r.data),
+
+  // ============================================================
+  // Phase 12: Natural-Language Instructions
+  // ============================================================
+
+  instruct: (id: string, text: string) =>
+    api
+      .post<InstructionResult>(
+        `/sessions/${id}/instructions`,
+        { text }
+      )
       .then((r) => r.data),
 };

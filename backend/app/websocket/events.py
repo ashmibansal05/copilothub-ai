@@ -29,6 +29,7 @@ class EventType(str, enum.Enum):
     DOCUMENT_READY = "DOCUMENT_READY"
     DOCUMENT_FAILED = "DOCUMENT_FAILED"
     DOCUMENT_REMOVED = "DOCUMENT_REMOVED"
+    REPORT_SAVED = "REPORT_SAVED"
     # Ephemeral connection / presence events (not stored)
     CONNECTED = "CONNECTED"
     PONG = "PONG"

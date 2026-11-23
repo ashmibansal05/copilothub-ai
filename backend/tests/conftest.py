@@ -10,8 +10,9 @@ os.environ["SECRET_KEY"] = "test-secret-key-test-secret-key-1234567890"
 os.environ["DEMO_MODE"] = "true"
 os.environ["AGENT_STEP_DELAY_SECONDS"] = "0"
 os.environ["AGENT_RETRY_BACKOFF_SECONDS"] = "0"
-os.environ["AGENT_REQUIRE_FINAL_APPROVAL"] = "false"  # tests turn it on where needed
-
+os.environ["AGENT_TOOLS_ENABLED"] = "false"  # earlier phases are tested in single-shot mode
+# Allow automated tests to finish without waiting for human approval
+os.environ["AGENT_REQUIRE_FINAL_APPROVAL"] = "false"
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -73,3 +74,9 @@ def set_brain(monkeypatch):
         monkeypatch.setattr(agent_runner, "brain_factory", brain.factory())
 
     return _set
+@pytest.fixture()
+def tools_on(monkeypatch):
+    """Enable the tool loop for one test (conftest turns it off by default)."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "agent_tools_enabled", True)

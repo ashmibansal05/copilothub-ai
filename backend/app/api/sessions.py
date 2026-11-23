@@ -99,7 +99,10 @@ def list_events(
     stmt = (
         select(AgentEvent)
         .where(AgentEvent.session_id == ctx.session.id)
-        .order_by(AgentEvent.created_at.desc())
+        .order_by(
+            AgentEvent.created_at.desc(),
+            AgentEvent.id.desc(),
+        )
         .limit(limit)
     )
     return list(reversed(db.scalars(stmt).all()))  # oldest first

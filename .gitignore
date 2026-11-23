@@ -19,7 +19,8 @@ data/embeddings/*
 data/documents/*
 !data/embeddings/.gitkeep
 !data/documents/.gitkeep
-
+# Generated ML models and runtime data
+/data/
 # OS / IDE
 .DS_Store
 .vscode/

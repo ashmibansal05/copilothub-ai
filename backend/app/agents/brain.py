@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.tools.base import ToolSpec
+
 
 @dataclass
 class StepResult:
@@ -21,15 +23,42 @@ class Evaluation:
     note: str = ""
 
 
+# ---- the tool-use protocol between a brain and the orchestrator ----
+@dataclass
+class ToolCall:
+    tool: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FinalAnswer:
+    text: str
+
+
+@dataclass
+class ToolObservation:
+    """What a brain sees of an earlier tool call in the same step."""
+
+    tool: str
+    arguments: dict[str, Any]
+    ok: bool
+    output: str
+
+
+AgentAction = ToolCall | FinalAnswer
+
+
 class AgentBrain(ABC):
-    """The 'thinking' part of the agent. The orchestrator (LangGraph) owns the loop,
-    limits, constraint enforcement and events; a brain only answers four questions.
-    `constraints` are human rules rendered as text; `notes` are relevant human
-    corrections/information chosen by the MemoryManager."""
+    """The 'thinking' part of the agent. The orchestrator (LangGraph) owns the loop, limits,
+    tool execution, constraint enforcement and events; a brain only decides things.
+
+    `constraints` are human rules rendered as text; `notes` are relevant human corrections
+    chosen by the MemoryManager."""
 
     engine: str  # short id stored in the DB, e.g. "demo" or "ollama:qwen3"
     description: str  # shown to humans
     simulated: bool
+    uses_tools: bool = False  # True: the orchestrator runs the tool loop (next_action)
 
     @abstractmethod
     async def make_plan(
@@ -42,8 +71,18 @@ class AgentBrain(ABC):
     @abstractmethod
     async def execute_step(
         self, task: str, step: str, history: list[dict], constraints: list[str],
-        notes: list[str] | None = None,
-    ) -> StepResult: ...
+        notes: list[str] | None = None, documents: list[dict] | None = None,
+    ) -> StepResult:
+        """Single-shot step (no tool loop). Used when AGENT_TOOLS_ENABLED=false."""
+
+    async def next_action(
+        self, task: str, step: str, observations: list[ToolObservation], constraints: list[str],
+        notes: list[str] | None = None, tools: list[ToolSpec] | tuple[ToolSpec, ...] = (),
+        force_final: bool = False,
+    ) -> AgentAction:
+        """Tool-use protocol: return ONE tool call, or the final findings for the step.
+        With force_final=True the brain must return a FinalAnswer."""
+        raise NotImplementedError(f"{type(self).__name__} does not support tools")
 
     @abstractmethod
     async def evaluate(
@@ -55,8 +94,3 @@ class AgentBrain(ABC):
         self, task: str, history: list[dict], constraints: list[str] | None = None,
         notes: list[str] | None = None,
     ) -> str: ...
-    @abstractmethod
-    async def execute_step(
-        self, task: str, step: str, history: list[dict], constraints: list[str],
-        notes: list[str] | None = None, documents: list[dict] | None = None,
-    ) -> StepResult: ...

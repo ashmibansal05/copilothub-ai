@@ -19,6 +19,7 @@ from app.models.intervention import (
 from app.models.memory import MemoryKind
 from app.models.session import AgentStatus
 from app.models.user import UserRole
+from app.nlp.feedback import record_outcome
 from app.schemas.intervention import InterventionCreate, InterventionRead
 from app.services import approval_service, event_service
 from app.services.conflict_manager import ConflictManager
@@ -238,6 +239,9 @@ async def process_intervention(db: Session, ctx: SessionContext, data: Intervent
 
     if new_conflicts:
         result += f"; {len(new_conflicts)} conflict(s) detected"
+    if data.origin_text:  # original sentence: audit trail and classifier feedback
+        details = {**details, "origin_text": data.origin_text[:500]}
+        record_outcome(db, sid, user.id, data.origin_text, t.value)
     row.details = details
     row.result = result
     db.commit()
