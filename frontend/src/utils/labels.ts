@@ -14,6 +14,7 @@ export const INTERVENTION_LABELS: Record<InterventionType, string> = {
   CHANGE_SOURCE: "Changed a source",
   REQUEST_REVIEW: "Requested a review",
   COMMENT: "Comment",
+  RESOLVE_CONFLICT: "Resolved a conflict",
 };
 
 export const ACTION_LABELS: Record<ConstraintAction, string> = {

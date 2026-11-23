@@ -42,6 +42,31 @@ class Settings(BaseSettings):
     agent_require_final_approval: bool = True
     agent_max_approval_rounds: int = Field(default=3, ge=1, le=10)
     agent_max_replans: int = Field(default=3, ge=0, le=10)
+        # ---- RAG (Phase 10) ----
+    data_dir: str = "../data"  # documents/ and embeddings/ live here
+    embedding_backend: str = "sentence_transformers"  # or "hashing" (lexical, no download)
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    rag_chunk_size: int = Field(default=900, ge=100, le=4000)
+    rag_chunk_overlap: int = Field(default=120, ge=0, le=1000)
+    rag_top_k: int = Field(default=4, ge=1, le=20)
+    rag_min_score: float = 0.15
+    max_upload_mb: int = Field(default=10, ge=1, le=100)
+    max_documents_per_session: int = Field(default=20, ge=1, le=200)
+    rag_max_chunks_per_document: int = Field(default=400, ge=1, le=5000)
+
+    @field_validator("embedding_backend")
+    @classmethod
+    def embedding_backend_must_be_known(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"sentence_transformers", "hashing"}:
+            raise ValueError("EMBEDDING_BACKEND must be 'sentence_transformers' or 'hashing'")
+        return value
+
+    @property
+    def data_path(self):
+        from pathlib import Path
+
+        return Path(self.data_dir).expanduser().resolve()
 
     @field_validator("secret_key")
     @classmethod
@@ -61,6 +86,7 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
 
 
 @lru_cache

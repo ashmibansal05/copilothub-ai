@@ -19,6 +19,8 @@ class InterventionCreate(BaseModel):
     priority: Priority | None = None
     action: ConstraintAction | None = None  # for ADD_CONSTRAINT
     constraint_id: uuid.UUID | None = None  # for REMOVE_CONSTRAINT
+    conflict_id: uuid.UUID | None = None  # for RESOLVE_CONFLICT
+    winner_constraint_id: uuid.UUID | None = None  # for RESOLVE_CONFLICT (null = remove both)
 
 
 class InterventionRead(BaseModel):

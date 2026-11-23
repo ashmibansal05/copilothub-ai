@@ -55,3 +55,8 @@ class AgentBrain(ABC):
         self, task: str, history: list[dict], constraints: list[str] | None = None,
         notes: list[str] | None = None,
     ) -> str: ...
+    @abstractmethod
+    async def execute_step(
+        self, task: str, step: str, history: list[dict], constraints: list[str],
+        notes: list[str] | None = None, documents: list[dict] | None = None,
+    ) -> StepResult: ...

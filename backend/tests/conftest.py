@@ -1,4 +1,8 @@
 import os
+import tempfile
+
+os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="copilothub-test-")
+os.environ["EMBEDDING_BACKEND"] = "hashing"  # no model download in tests
 
 # Must be set BEFORE importing the app (settings are read at import time).
 os.environ["DATABASE_URL"] = "sqlite://"

@@ -8,6 +8,7 @@ from app.agents.runner import agent_runner
 from app.agents.state import ApprovalDecision
 from app.api.deps import SessionContext
 from app.models.approval import ApprovalKind, ApprovalStatus
+from app.models.conflict import Conflict, ConflictStatus
 from app.models.constraint import Constraint, ConstraintAction
 from app.models.intervention import (
     Intervention,
@@ -20,6 +21,7 @@ from app.models.session import AgentStatus
 from app.models.user import UserRole
 from app.schemas.intervention import InterventionCreate, InterventionRead
 from app.services import approval_service, event_service
+from app.services.conflict_manager import ConflictManager
 from app.services.constraint_manager import ConstraintManager
 from app.services.memory_manager import MemoryManager
 from app.services.readers import constraint_read, intervention_read
@@ -36,7 +38,7 @@ EDITOR_TYPES = {
     T.REQUEST_REVIEW, T.ADD_CONSTRAINT, T.REMOVE_CONSTRAINT, T.REJECT_SOURCE, T.CHANGE_SOURCE,
 }
 ROLE_PERMISSIONS: dict[UserRole, set[T]] = {
-    UserRole.OWNER: set(T),  # editors' set + MODIFY_TASK
+    UserRole.OWNER: set(T),  # editors' set + MODIFY_TASK + RESOLVE_CONFLICT
     UserRole.EDITOR: EDITOR_TYPES,
     UserRole.VIEWER: set(),
 }
@@ -65,18 +67,21 @@ def _validate(data: InterventionCreate) -> tuple[str | None, str | None]:
         _need(target and len(target) >= 2, "A target is required")
     elif t == T.REMOVE_CONSTRAINT:
         _need(data.constraint_id is not None, "constraint_id is required")
+    elif t == T.RESOLVE_CONFLICT:
+        _need(data.conflict_id is not None, "conflict_id is required")
     return content, target
 
 
 def _add_constraint(
     db: Session, ctx: SessionContext, row: Intervention, action: ConstraintAction,
-    target: str, priority: Priority, added: list[Constraint],
+    target: str, priority: Priority, added: list[Constraint], new_conflicts: list[Conflict],
 ) -> Constraint:
     constraint, created = ConstraintManager.add(
         db, ctx.session.id, ctx.user, action, target, priority, row.id
     )
     if created:
         added.append(constraint)
+        new_conflicts.extend(ConflictManager.detect(db, ctx.session.id, constraint))
         common = dict(
             session_id=ctx.session.id, key=target, author=ctx.user.username,
             user_id=ctx.user.id, intervention_id=row.id, importance=4,
@@ -127,7 +132,9 @@ async def process_intervention(db: Session, ctx: SessionContext, data: Intervent
     db.flush()
 
     added: list[Constraint] = []
-    removed: list[Constraint] = []
+    removed: list[tuple[Constraint, str]] = []  # (constraint, reason)
+    new_conflicts: list[Conflict] = []
+    resolved_conflicts: list[Conflict] = []
     approval_event: dict | None = None
     details: dict = {}
     result = ""
@@ -148,16 +155,16 @@ async def process_intervention(db: Session, ctx: SessionContext, data: Intervent
         replanning = agent_runner.request_replan(sid)
         result = "Task updated" + ("; the agent will re-plan at its next checkpoint" if replanning else "")
     elif t == T.REJECT_SOURCE:
-        c = _add_constraint(db, ctx, row, ConstraintAction.EXCLUDE_SOURCE, target, priority, added)
+        c = _add_constraint(db, ctx, row, ConstraintAction.EXCLUDE_SOURCE, target, priority, added, new_conflicts)
         details = {"constraint_id": str(c.id)}
         result = f"Source '{target}' is now excluded"
     elif t == T.CHANGE_SOURCE:
-        old = _add_constraint(db, ctx, row, ConstraintAction.EXCLUDE_SOURCE, target, priority, added)
-        new = _add_constraint(db, ctx, row, ConstraintAction.PREFER_SOURCE, content, priority, added)
+        old = _add_constraint(db, ctx, row, ConstraintAction.EXCLUDE_SOURCE, target, priority, added, new_conflicts)
+        new = _add_constraint(db, ctx, row, ConstraintAction.PREFER_SOURCE, content, priority, added, new_conflicts)
         details = {"excluded_constraint_id": str(old.id), "preferred_constraint_id": str(new.id)}
         result = f"Excluding '{target}', preferring '{content}'"
     elif t == T.ADD_CONSTRAINT:
-        c = _add_constraint(db, ctx, row, data.action, target, priority, added)
+        c = _add_constraint(db, ctx, row, data.action, target, priority, added, new_conflicts)
         details = {"constraint_id": str(c.id), "action": data.action.value, "created": c in added}
         result = "Constraint added" if c in added else "An identical constraint is already active"
     elif t == T.REMOVE_CONSTRAINT:
@@ -168,10 +175,42 @@ async def process_intervention(db: Session, ctx: SessionContext, data: Intervent
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Constraint not found or already removed")
         if c.action in (ConstraintAction.EXCLUDE_SOURCE, ConstraintAction.INCLUDE_SOURCE):
             MemoryManager.deactivate_source(db, sid, c.target)
-        removed.append(c)
+        resolved_conflicts.extend(ConflictManager.close_for_constraint(db, c))
+        removed.append((c, "removed"))
         row.target = c.target
         details = {"constraint_id": str(c.id)}
         result = "Constraint removed"
+    elif t == T.RESOLVE_CONFLICT:
+        conflict = db.get(Conflict, data.conflict_id)
+        if conflict is None or conflict.session_id != sid:
+            db.rollback()
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Conflict not found")
+        if conflict.status != ConflictStatus.OPEN:
+            db.rollback()
+            raise HTTPException(status.HTTP_409_CONFLICT, "This conflict is already resolved")
+        try:
+            superseded = ConflictManager.resolve(db, conflict, user, data.winner_constraint_id, content)
+        except ValueError:
+            db.rollback()
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The winner must be one of the two constraints in the conflict")
+        for c in superseded:
+            removed.append((c, "superseded"))
+            if c.action in (ConstraintAction.EXCLUDE_SOURCE, ConstraintAction.INCLUDE_SOURCE):
+                MemoryManager.deactivate_source(db, sid, c.target)
+        resolved_conflicts.append(conflict)
+        MemoryManager.remember(
+            db, kind=MemoryKind.DECISION, importance=4,
+            content=f"Conflict resolved by {user.username}: " + (
+                "both instructions removed" if data.winner_constraint_id is None
+                else f"kept the instruction on '{target or ''}'".replace(" on ''", "")
+            ) + (f" ({content})" if content else ""),
+            **memory,
+        )
+        details = {
+            "conflict_id": str(conflict.id),
+            "winner_constraint_id": str(data.winner_constraint_id) if data.winner_constraint_id else None,
+        }
+        result = "Conflict resolved"
     elif t in (T.APPROVE, T.REJECT):
         approved = t == T.APPROVE
         label = "final draft" if pending.kind == ApprovalKind.FINAL_REPORT else "review request"
@@ -197,6 +236,8 @@ async def process_intervention(db: Session, ctx: SessionContext, data: Intervent
     elif t == T.RESUME:
         result = "Resumed"
 
+    if new_conflicts:
+        result += f"; {len(new_conflicts)} conflict(s) detected"
     row.details = details
     row.result = result
     db.commit()
@@ -205,8 +246,28 @@ async def process_intervention(db: Session, ctx: SessionContext, data: Intervent
     # ---- broadcast (after the commit, so listeners can immediately read the data) ----
     for c in added:
         await event_service.publish(db, sid, EventType.CONSTRAINT_ADDED, {"constraint": constraint_read(c).model_dump(mode="json")}, user)
-    for c in removed:
-        await event_service.publish(db, sid, EventType.CONSTRAINT_REMOVED, {"constraint_id": str(c.id), "target": c.target, "action": c.action.value}, user)
+    for c, reason in removed:
+        await event_service.publish(
+            db, sid, EventType.CONSTRAINT_REMOVED,
+            {"constraint_id": str(c.id), "target": c.target, "action": c.action.value, "reason": reason}, user,
+        )
+    for conflict in new_conflicts:
+        read = ConflictManager.to_read(db, conflict)
+        await event_service.publish(db, sid, EventType.CONFLICT_DETECTED, {"conflict": read.model_dump(mode="json")}, user)
+        await event_service.publish(
+            db, sid, EventType.AGENT_MESSAGE,
+            {"kind": "warning", "text": (
+                f"Conflict detected: \"{read.constraint_a.description}\" vs \"{read.constraint_b.description}\". "
+                + ("The agent will wait for the owner to resolve it. " if read.requires_resolution else "")
+                + (read.provisional or "")
+            )},
+            user,
+        )
+    for conflict in resolved_conflicts:
+        read = ConflictManager.to_read(db, conflict)
+        await event_service.publish(db, sid, EventType.CONFLICT_RESOLVED, {"conflict": read.model_dump(mode="json")}, user)
+    if resolved_conflicts:
+        agent_runner.conflicts_changed(sid)
     if approval_event is not None:
         await event_service.publish(db, sid, EventType.APPROVAL_COMPLETED, approval_event, user)
 

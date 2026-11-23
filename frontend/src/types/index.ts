@@ -105,7 +105,7 @@ export interface OnlineUser {
 export type InterventionType =
   | "APPROVE" | "REJECT" | "CORRECT" | "PAUSE" | "RESUME" | "MODIFY_TASK"
   | "ADD_INFORMATION" | "ADD_CONSTRAINT" | "REMOVE_CONSTRAINT" | "REJECT_SOURCE"
-  | "CHANGE_SOURCE" | "REQUEST_REVIEW" | "COMMENT";
+  | "CHANGE_SOURCE" | "REQUEST_REVIEW" | "COMMENT" | "RESOLVE_CONFLICT";
 
 export type Priority = "LOW" | "MEDIUM" | "HIGH";
 export type ConstraintAction = "EXCLUDE_SOURCE" | "INCLUDE_SOURCE" | "PREFER_SOURCE" | "INSTRUCTION";
@@ -189,4 +189,75 @@ export interface AgentState {
   active_constraints: Constraint[];
   human_interventions: Intervention[]; // most recent first
   pending_approval: PendingApproval | null;
+    open_conflicts: Conflict[];
+}
+// ---------- Conflicts (Phase 9) ----------
+
+export interface ConflictSide {
+  constraint_id: string;
+  action: ConstraintAction;
+  target: string;
+  description: string;
+  priority: Priority;
+  created_by_username: string | null;
+  created_by_role: string | null;
+  still_active: boolean;
+}
+
+export interface Conflict {
+  id: string;
+  session_id: string;
+  kind: "SOURCE_POLICY";
+  status: "OPEN" | "RESOLVED";
+  constraint_a: ConflictSide; // the older instruction
+  constraint_b: ConflictSide; // the newer instruction
+  requires_resolution: boolean;
+  rule_applied: string;
+  provisional: string | null;
+  suggested_winner_id: string | null;
+  resolution: "KEEP_A" | "KEEP_B" | "REMOVE_BOTH" | "AUTO_CLOSED" | null;
+  resolution_note: string | null;
+  resolved_by_username: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+// ---------- Documents / RAG (Phase 10) ----------
+
+export interface DocumentInfo {
+  id: string;
+  session_id: string;
+  title: string;
+  filename: string;
+  source_name: string;
+  source_type: string;
+  status: "PROCESSING" | "READY" | "FAILED";
+  error: string | null;
+  size_bytes: number;
+  page_count: number | null;
+  chunk_count: number;
+  flagged_chunks: number;
+  embedding_backend: string | null;
+  uploaded_by_username: string | null;
+  created_at: string;
+}
+
+export interface ChunkInfo {
+  id: string;
+  chunk_index: number;
+  page: number | null;
+  text: string;
+  flagged: boolean;
+}
+
+export interface SearchHit {
+  chunk_id: string;
+  document_id: string;
+  title: string;
+  source_name: string;
+  source_type: string;
+  page: number | null;
+  text: string;
+  score: number;
+  preferred: boolean;
 }

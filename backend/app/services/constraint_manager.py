@@ -41,7 +41,7 @@ def _target_keys(target: str) -> set[str]:
             keys.add(_norm(parts[-2]))
     return {k for k in keys if len(k) >= 2}
 
-
+target_keys = _target_keys
 class ConstraintManager:
     # ---------------------------------------------------------------- database
     @staticmethod

@@ -23,7 +23,7 @@ class InterventionType(str, enum.Enum):
     CHANGE_SOURCE = "CHANGE_SOURCE"
     REQUEST_REVIEW = "REQUEST_REVIEW"
     COMMENT = "COMMENT"
-    # ASK_AGENT is intentionally not implemented yet.
+    RESOLVE_CONFLICT = "RESOLVE_CONFLICT"
 
 
 class Priority(str, enum.Enum):

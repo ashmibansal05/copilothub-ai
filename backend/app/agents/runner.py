@@ -67,6 +67,13 @@ class AgentRunner:
         orch.request_replan()
         return True
 
+    def conflicts_changed(self, session_id: uuid.UUID) -> bool:
+        orch = self._active(session_id)
+        if orch is None:
+            return False
+        orch.notify_conflicts_changed()
+        return True
+
     def _cleanup(self, session_id: uuid.UUID, task: asyncio.Task) -> None:
         if self._tasks.get(session_id) is task:
             self._tasks.pop(session_id, None)

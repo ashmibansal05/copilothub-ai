@@ -14,6 +14,7 @@ from app.services import approval_service, event_service
 from app.services.constraint_manager import ConstraintManager
 from app.services.readers import approval_read, constraint_read, intervention_read
 from app.websocket.events import EventType
+from app.services.conflict_manager import ConflictManager
 
 logger = logging.getLogger("copilothub.agent")
 
@@ -48,6 +49,7 @@ def build_state_read(db: Session, session: AgentSession) -> AgentStateRead:
         active_constraints=[constraint_read(c) for c in ConstraintManager.active(db, session.id)],
         human_interventions=[intervention_read(i) for i in interventions],
         pending_approval=approval_read(pending) if pending else None,
+        open_conflicts=[ConflictManager.to_read(db, c) for c in ConflictManager.open_conflicts(db, session.id)],
     )
 
 

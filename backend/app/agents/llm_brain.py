@@ -1,12 +1,15 @@
 from app.agents.brain import AgentBrain, Evaluation, StepResult
+
 from app.agents.prompts import (
     EVALUATE_INSTRUCTION,
     EXECUTE_INSTRUCTION,
+    EXECUTE_WITH_DOCS_INSTRUCTION,
     PLAN_INSTRUCTION,
     SUMMARY_INSTRUCTION,
     build_messages,
     fence,
 )
+
 from app.llm.base import LLMProvider, LLMResponseError
 from app.llm.utils import extract_json
 
@@ -51,16 +54,23 @@ class LLMBrain(AgentBrain):
     def tool_for_step(self, step: str) -> str:
         return "llm_reasoning"
 
-    async def execute_step(self, task, step, history, constraints, notes=None) -> StepResult:
+    async def execute_step(self, task, step, history, constraints, notes=None, documents=None) -> StepResult:
+        passages = [
+            f"[{i}] {d['title']} ({d['source_name']}" + (f", page {d['page']}" if d.get("page") else "") + f")\n{d['text']}"
+            for i, d in enumerate(documents or [], start=1)
+        ]
+        template = EXECUTE_WITH_DOCS_INSTRUCTION if passages else EXECUTE_INSTRUCTION
         messages = build_messages(
             task,
-            EXECUTE_INSTRUCTION.format(step=fence(step)),
+            template.format(step=fence(step)),
             constraints,
+            documents=passages or None,
             tool_results=_history_snippets(history),
             human_notes=notes,
         )
         text = await self.provider.generate(messages, max_tokens=400)
         return StepResult(tool="llm_reasoning", output=text, simulated=False, input={"step": step})
+
 
     async def evaluate(self, task, step, result, history) -> Evaluation:
         messages = build_messages(

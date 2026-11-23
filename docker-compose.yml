@@ -31,12 +31,17 @@ services:
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3}
+      DATA_DIR: /data
+      EMBEDDING_BACKEND: hashing
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     volumes:
       - ./backend:/app
+      - ./backend:/app
+      - ./data:/data
+      - hfcache:/root/.cache/huggingface   # keeps the downloaded embedding model
 
   frontend:
     build: ./frontend
@@ -53,3 +58,4 @@ services:
 
 volumes:
   pgdata:
+  hfcache:

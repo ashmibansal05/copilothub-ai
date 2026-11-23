@@ -33,6 +33,12 @@ EVALUATE_INSTRUCTION = (
     '"ok": <true if usable, false if the step should be retried>, '
     '"note": "<one short sentence>"}}'
 )
+EXECUTE_WITH_DOCS_INSTRUCTION = (
+    'Carry out ONLY this research step: "{step}". '
+    "Base your findings on the passages in <retrieved_documents> and cite them as [1], [2], ... "
+    "Say clearly if the passages do not answer the step. Do not invent facts, sources or URLs. "
+    "Write at most 150 words of plain text."
+)
 
 SUMMARY_INSTRUCTION = (
     "Write a short summary (at most 200 words) of what the findings in <tool_results> "

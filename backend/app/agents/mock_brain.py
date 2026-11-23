@@ -107,14 +107,15 @@ class MockBrain(AgentBrain):
             for t, p, st in SOURCE_BANK[key]
         ]
 
-    async def execute_step(self, task, step, history, constraints, notes=None) -> StepResult:
+    async def execute_step(self, task, step, history, constraints, notes=None, documents=None) -> StepResult:
         await self._pause()
         sources = self._sources_for(step)
+        extra = f" It also received {len(documents)} passage(s) from uploaded documents." if documents else ""
         return StepResult(
             tool=self.tool_for_step(step),
             output=(
                 f"[SIMULATED] {step}: collected {len(sources)} placeholder sources and drafted notes. "
-                "No real web or document access happened in demo mode."
+                f"No real web access happened in demo mode.{extra}"
             ),
             sources=sources,
             simulated=True,

@@ -4,7 +4,8 @@ from app.models.approval import Approval
 from app.models.constraint import Constraint
 from app.models.intervention import Intervention
 from app.schemas.intervention import ApprovalRead, ConstraintRead, InterventionRead
-
+from app.models.document import Document
+from app.schemas.document import DocumentRead
 
 def describe_constraint(action: str, target: str) -> str:
     if action == "EXCLUDE_SOURCE":
@@ -51,4 +52,22 @@ def constraint_read(c: Constraint) -> ConstraintRead:
 def approval_read(a: Approval) -> ApprovalRead:
     return ApprovalRead(
         id=a.id, kind=a.kind, status=a.status, payload=a.payload or {}, created_at=a.created_at
+    )
+def document_read(doc: Document) -> DocumentRead:
+    return DocumentRead(
+        id=doc.id,
+        session_id=doc.session_id,
+        title=doc.title,
+        filename=doc.filename,
+        source_name=doc.source_name,
+        source_type=doc.source_type,
+        status=doc.status,
+        error=doc.error,
+        size_bytes=doc.size_bytes,
+        page_count=doc.page_count,
+        chunk_count=doc.chunk_count,
+        flagged_chunks=doc.flagged_chunks,
+        embedding_backend=doc.embedding_backend,
+        uploaded_by_username=doc.uploader.username if doc.uploader else None,
+        created_at=doc.created_at,
     )

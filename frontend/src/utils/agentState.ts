@@ -1,6 +1,18 @@
-import type { AgentState, AgentStatus, Constraint, Intervention, SessionEvent } from "../types";
 
-export function emptyAgentState(sessionId: string, task: string, status: AgentStatus): AgentState {
+import type {
+  AgentState,
+  AgentStatus,
+  Conflict,
+  Constraint,
+  Intervention,
+  SessionEvent,
+} from "../types";
+
+export function emptyAgentState(
+  sessionId: string,
+  task: string,
+  status: AgentStatus
+): AgentState {
   return {
     session_id: sessionId,
     status,
@@ -17,12 +29,19 @@ export function emptyAgentState(sessionId: string, task: string, status: AgentSt
     active_constraints: [],
     human_interventions: [],
     pending_approval: null,
+
+    // Phase 9: Conflict resolution
+    open_conflicts: [],
   };
 }
 
 /** Folds one live event into the agent snapshot loaded from GET /state. */
-export function applyAgentEvent(prev: AgentState, e: SessionEvent): AgentState {
+export function applyAgentEvent(
+  prev: AgentState,
+  e: SessionEvent
+): AgentState {
   const p = e.payload;
+
   switch (e.type) {
     case "STEP_STARTED":
       return {
@@ -32,6 +51,7 @@ export function applyAgentEvent(prev: AgentState, e: SessionEvent): AgentState {
         progress: p.progress ?? prev.progress,
         engine: p.engine ?? prev.engine,
       };
+
     case "STEP_COMPLETED":
       return {
         ...prev,
@@ -41,18 +61,76 @@ export function applyAgentEvent(prev: AgentState, e: SessionEvent): AgentState {
         progress: p.progress ?? prev.progress,
         confidence: p.confidence ?? prev.confidence,
       };
+
     case "COMPLETED":
-      return { ...prev, current_step: "Completed", progress: 100, step_index: prev.total_steps, pending_approval: null };
+      return {
+        ...prev,
+        current_step: "Completed",
+        progress: 100,
+        step_index: prev.total_steps,
+        pending_approval: null,
+      };
+
     case "FAILED":
-      return { ...prev, current_step: "Failed", pending_approval: null };
+      return {
+        ...prev,
+        current_step: "Failed",
+        pending_approval: null,
+      };
+
+    // ============================================================
+    // Phase 8: Constraints
+    // ============================================================
+
     case "CONSTRAINT_ADDED": {
       const c = p.constraint as Constraint;
+
       return prev.active_constraints.some((x) => x.id === c.id)
         ? prev
-        : { ...prev, active_constraints: [...prev.active_constraints, c] };
+        : {
+            ...prev,
+            active_constraints: [...prev.active_constraints, c],
+          };
     }
+
     case "CONSTRAINT_REMOVED":
-      return { ...prev, active_constraints: prev.active_constraints.filter((c) => c.id !== p.constraint_id) };
+      return {
+        ...prev,
+        active_constraints: prev.active_constraints.filter(
+          (c) => c.id !== p.constraint_id
+        ),
+      };
+
+    // ============================================================
+    // Phase 9: Conflict Resolution
+    // ============================================================
+
+    case "CONFLICT_DETECTED": {
+      const c = p.conflict as Conflict;
+
+      return prev.open_conflicts.some((x) => x.id === c.id)
+        ? prev
+        : {
+            ...prev,
+            open_conflicts: [...prev.open_conflicts, c],
+          };
+    }
+
+    case "CONFLICT_RESOLVED": {
+      const c = p.conflict as Conflict;
+
+      return {
+        ...prev,
+        open_conflicts: prev.open_conflicts.filter(
+          (x) => x.id !== c.id
+        ),
+      };
+    }
+
+    // ============================================================
+    // Phase 7: Human Approvals and Interventions
+    // ============================================================
+
     case "APPROVAL_REQUESTED":
       return {
         ...prev,
@@ -64,17 +142,33 @@ export function applyAgentEvent(prev: AgentState, e: SessionEvent): AgentState {
           created_at: e.created_at,
         },
       };
+
     case "APPROVAL_COMPLETED":
-      return { ...prev, pending_approval: null };
-    case "HUMAN_INTERVENTION": {
-      const iv = p.intervention as Intervention;
-      if (prev.human_interventions.some((x) => x.id === iv.id)) return prev;
       return {
         ...prev,
-        human_interventions: [iv, ...prev.human_interventions].slice(0, 20),
-        current_task: iv.type === "MODIFY_TASK" && iv.content ? iv.content : prev.current_task,
+        pending_approval: null,
+      };
+
+    case "HUMAN_INTERVENTION": {
+      const iv = p.intervention as Intervention;
+
+      if (prev.human_interventions.some((x) => x.id === iv.id)) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        human_interventions: [
+          iv,
+          ...prev.human_interventions,
+        ].slice(0, 20),
+        current_task:
+          iv.type === "MODIFY_TASK" && iv.content
+            ? iv.content
+            : prev.current_task,
       };
     }
+
     default:
       return prev;
   }

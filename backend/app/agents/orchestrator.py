@@ -16,7 +16,11 @@ from app.db import session as db_session
 from app.models.agent import AgentAction, AgentState
 from app.models.approval import Approval, ApprovalKind, ApprovalStatus
 from app.models.session import AgentSession, AgentStatus
+from app.models.source import Source
+from app.rag import service as rag_service
+from app.rag.embeddings import get_embedder
 from app.services import approval_service, event_service
+from app.services.conflict_manager import ConflictManager
 from app.services.constraint_manager import ConstraintManager, ConstraintView
 from app.services.memory_manager import MemoryManager
 from app.websocket.events import EventType
@@ -48,7 +52,9 @@ class AgentOrchestrator:
           |                                 +-> finalize -+-> END (approved)
           +---------------------------------------------+-> plan (task changed)
                                                          +-> finalize (draft rejected: revise)
-    """
+
+    Before acting (and before finalizing) the agent stops while a human review is
+    requested or an instruction conflict needs the owner's decision."""
 
     def __init__(
         self,
@@ -63,13 +69,15 @@ class AgentOrchestrator:
         self.resume_event = asyncio.Event()
         self.resume_event.set()  # set = running, cleared = paused
         self._started = time.monotonic()
-        self._paused_total = 0.0
+        self._paused_total = 0.0  # time spent paused or waiting for humans (not billed to the budget)
         # human input that arrives while the agent is busy
         self._review_request: tuple[uuid.UUID | None, str, str | None] | None = None
         self._replan_requested = False
         self._replans = 0
         self._approval_future: asyncio.Future[ApprovalDecision] | None = None
         self._pending_approval_id: uuid.UUID | None = None
+        self._conflicts_event = asyncio.Event()
+        self._retrieval_warned = False
         self.graph = self._build_graph()
 
     # ------------------------------------------------------------------ control
@@ -84,6 +92,9 @@ class AgentOrchestrator:
 
     def request_replan(self) -> None:
         self._replan_requested = True
+
+    def notify_conflicts_changed(self) -> None:
+        self._conflicts_event.set()
 
     def resolve_approval(self, approval_id: uuid.UUID, decision: ApprovalDecision) -> bool:
         future = self._approval_future
@@ -212,12 +223,18 @@ class AgentOrchestrator:
     async def act_node(self, state: AgentGraphState) -> dict[str, Any]:
         await self.checkpoint()
         await self._maybe_review()
+        await self._wait_for_conflicts()
         assert self.brain is not None
         i, plan = state["step_index"], state["plan"]
         n, step = len(plan), plan[i]
         tool = self.brain.tool_for_step(step)
         progress = self._progress(i, n)
-        ctx = await self._human_context(f"{state['task']} {step}")
+        query = f"{state['task']} {step}"
+        ctx = await self._human_context(query)
+
+        # Retrieval already skips excluded sources; the filter below is a second line of defence.
+        chunks = await self._retrieve_documents(query, await self._active_views())
+        documents = [c.as_prompt() for c in chunks]
 
         await self._save_state(current_step=step, progress=progress)
         await self._emit(EventType.STEP_STARTED, {
@@ -231,13 +248,15 @@ class AgentOrchestrator:
         result: StepResult = await self._attempt(
             "ACT",
             lambda: self.brain.execute_step(
-                state["task"], step, state.get("observations", []), ctx.constraints, notes=ctx.notes
+                state["task"], step, state.get("observations", []), ctx.constraints,
+                notes=ctx.notes, documents=documents or None,
             ),
             step_index=i + 1, tool_name=tool, input_data={"step": step},
         )
+        result.sources = list(result.sources) + self._document_sources(chunks)
 
         # Enforcement point: whatever the brain returned, the CURRENT human rules decide
-        # which sources the agent may keep.
+        # which sources the agent may keep (rules may have changed during the call).
         views = await self._active_views()
         result.sources, result.rejected_sources = ConstraintManager.filter_sources(views, result.sources)
         if result.rejected_sources:
@@ -250,14 +269,16 @@ class AgentOrchestrator:
         duration = self._ms(started)
         await self._record_action(
             i + 1, "TOOL_CALL", result.tool, {"step": step},
-            {"output": result.output[:2000], "sources": result.sources, "rejected_sources": result.rejected_sources},
+            {"output": result.output[:2000], "sources": result.sources,
+             "rejected_sources": result.rejected_sources, "retrieved_chunks": len(chunks)},
             result.success, None, duration,
         )
+        await self._record_sources(i + 1, result)
         await self._emit(EventType.TOOL_COMPLETED, {
             "tool": result.tool, "step_index": i + 1, "success": result.success,
             "duration_ms": duration, "output": result.output[:500],
             "sources": result.sources, "rejected_sources": result.rejected_sources,
-            "simulated": result.simulated,
+            "retrieved_chunks": len(chunks), "simulated": result.simulated,
         })
         return {"last_result": asdict(result), "steps_executed": state.get("steps_executed", 0) + 1}
 
@@ -345,6 +366,7 @@ class AgentOrchestrator:
 
     async def finalize_node(self, state: AgentGraphState) -> dict[str, Any]:
         await self.checkpoint()
+        await self._wait_for_conflicts()
         assert self.brain is not None
         if self._consume_replan():
             return {"decision": "replan", "approved": False}
@@ -395,7 +417,7 @@ class AgentOrchestrator:
         })
         return {"approval_round": round_no, "approved": False, "decision": "revise"}
 
-    # ------------------------------------------------------------------ approvals
+    # ------------------------------------------------------------------ waiting for humans
     async def approval_gate(
         self, kind: ApprovalKind, payload: dict, requested_by: uuid.UUID | None = None
     ) -> ApprovalDecision:
@@ -419,9 +441,11 @@ class AgentOrchestrator:
         await self._emit(EventType.AGENT_MESSAGE, {
             "kind": "system", "text": "The agent is waiting for human approval.",
         })
+        waited_from = time.monotonic()
         try:
             decision = await future
         finally:
+            self._paused_total += time.monotonic() - waited_from  # human time is not agent time
             self._approval_future, self._pending_approval_id = None, None
         await self._set_status(AgentStatus.RUNNING, {AgentStatus.WAITING_FOR_APPROVAL})
         return decision
@@ -434,6 +458,32 @@ class AgentOrchestrator:
         await self.approval_gate(
             ApprovalKind.REVIEW, {"requested_by": username, "note": note}, requested_by=user_id
         )
+
+    def _blocking_conflicts(self) -> int:
+        with self._db() as db:
+            return ConflictManager.count_blocking(db, self.session_id)
+
+    async def _wait_for_conflicts(self) -> None:
+        """If two human instructions contradict each other and the priority rules cannot
+        decide, the agent stops until the owner resolves the conflict explicitly."""
+        if self._blocking_conflicts() == 0:
+            return
+        waited_from = time.monotonic()
+        await self._set_status(AgentStatus.WAITING_FOR_APPROVAL, {AgentStatus.RUNNING, AgentStatus.PLANNING})
+        await self._emit(EventType.AGENT_MESSAGE, {
+            "kind": "system",
+            "text": "The agent is waiting for the owner to resolve a conflict between human instructions.",
+        })
+        while True:
+            self._conflicts_event.clear()
+            if self._blocking_conflicts() == 0:
+                break
+            await self._conflicts_event.wait()
+        self._paused_total += time.monotonic() - waited_from
+        await self._set_status(AgentStatus.RUNNING, {AgentStatus.WAITING_FOR_APPROVAL})
+        await self._emit(EventType.AGENT_MESSAGE, {
+            "kind": "system", "text": "The conflict was resolved. The agent continues.",
+        })
 
     def _consume_replan(self) -> bool:
         if not self._replan_requested:
@@ -466,17 +516,74 @@ class AgentOrchestrator:
         if await self._set_status(AgentStatus.FAILED, FINISHABLE):
             await self._emit(EventType.FAILED, {"error": error})
 
-    # ------------------------------------------------------------------ helpers
-    async def _human_context(self, query: str) -> HumanContext:
-        """Active constraints (always) plus the few relevant memory notes (selected)."""
+    # ------------------------------------------------------------------ human context & sources
+    def _human_context_sync(self, query: str) -> HumanContext:
         with self._db() as db:
-            views = ConstraintManager.to_views(ConstraintManager.active(db, self.session_id))
-            notes = MemoryManager.retrieve(db, self.session_id, query)
+            views = ConstraintManager.to_views(ConflictManager.effective_constraints(db, self.session_id))
+            notes = MemoryManager.retrieve(db, self.session_id, query, embedder=get_embedder())
         return HumanContext(constraints=ConstraintManager.prompt_lines(views), notes=notes)
 
+    async def _human_context(self, query: str) -> HumanContext:
+        """Effective constraints (always) plus the few relevant memory notes (selected).
+        Runs in a worker thread because embedding may load a model."""
+        return await asyncio.to_thread(self._human_context_sync, query)
+
     async def _active_views(self) -> list[ConstraintView]:
+        """The constraints the agent must obey RIGHT NOW (losing sides of open conflicts excluded)."""
         with self._db() as db:
-            return ConstraintManager.to_views(ConstraintManager.active(db, self.session_id))
+            return ConstraintManager.to_views(ConflictManager.effective_constraints(db, self.session_id))
+
+    def _retrieve_sync(self, query: str, views: list[ConstraintView]):
+        with self._db() as db:
+            return rag_service.retrieve_chunks(db, self.session_id, query, self.settings.rag_top_k, views)
+
+    async def _retrieve_documents(self, query: str, views: list[ConstraintView]):
+        try:
+            return await asyncio.to_thread(self._retrieve_sync, query, views)
+        except Exception as exc:
+            logger.warning("Document retrieval failed: %s", exc, exc_info=True)
+            if not self._retrieval_warned:
+                self._retrieval_warned = True
+                await self._emit(EventType.AGENT_MESSAGE, {
+                    "kind": "warning",
+                    "text": f"Document retrieval failed ({exc.__class__.__name__}); continuing without documents.",
+                })
+            return []
+
+    @staticmethod
+    def _document_sources(chunks) -> list[dict]:
+        by_doc: dict[uuid.UUID, dict] = {}
+        for c in chunks:
+            entry = by_doc.get(c.document_id)
+            if entry is None or c.score > entry["score"]:
+                by_doc[c.document_id] = {
+                    "title": c.title, "publisher": c.source_name, "source_type": c.source_type,
+                    "document_id": str(c.document_id), "origin": "document", "simulated": False,
+                    "score": round(c.score, 3), "page": c.page, "excerpt": c.text[:160],
+                }
+        return list(by_doc.values())
+
+    async def _record_sources(self, step_index: int, result: StepResult) -> None:
+        def row(source: dict, status: str) -> Source:
+            origin = "DOCUMENT" if source.get("origin") == "document" else (
+                "SIMULATED" if source.get("simulated") else "OTHER")
+            document_id = uuid.UUID(source["document_id"]) if source.get("document_id") else None
+            return Source(
+                session_id=self.session_id, document_id=document_id, step_index=step_index,
+                title=str(source.get("title", ""))[:300], publisher=str(source.get("publisher", ""))[:200],
+                source_type=source.get("source_type") or None, origin=origin, status=status,
+                rejected_by=source.get("rejected_by") or None, score=source.get("score"),
+            )
+
+        rows = [row(s, "USED") for s in result.sources] + [row(s, "REJECTED") for s in result.rejected_sources]
+        if not rows:
+            return
+        try:
+            with self._db() as db:
+                db.add_all(rows)
+                db.commit()
+        except Exception:
+            logger.warning("Could not record sources for session %s", self.session_id, exc_info=True)
 
     @staticmethod
     def _refilter(observations: list[dict], views: list[ConstraintView]) -> tuple[list[dict], int]:
@@ -490,6 +597,7 @@ class AgentOrchestrator:
             out.append({**obs, "sources": allowed})
         return out, removed
 
+    # ------------------------------------------------------------------ plumbing
     @staticmethod
     def _ms(started: float) -> int:
         return int((time.monotonic() - started) * 1000)
@@ -525,7 +633,7 @@ class AgentOrchestrator:
                     await self._emit(EventType.TOOL_COMPLETED, {
                         "tool": tool_name, "step_index": step_index, "success": False,
                         "error": message, "duration_ms": self._ms(started), "sources": [],
-                        "rejected_sources": [],
+                        "rejected_sources": [], "retrieved_chunks": 0,
                         "simulated": bool(self.brain and self.brain.simulated),
                     })
                 else:

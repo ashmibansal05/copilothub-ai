@@ -5,7 +5,9 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import AgentPanel from "../components/AgentPanel";
 import ApprovalCard from "../components/ApprovalCard";
+import ConflictCard from "../components/ConflictCard";
 import ConstraintsPanel from "../components/ConstraintsPanel";
+import DocumentsPanel from "../components/DocumentsPanel";
 import EventTimeline from "../components/EventTimeline";
 import InterventionDialog from "../components/InterventionDialog";
 import type { DialogKind } from "../components/InterventionDialog";
@@ -18,7 +20,7 @@ import type { ConnectionStatus } from "../hooks/useSessionSocket";
 import { getErrorMessage } from "../services/api";
 import { sessionService } from "../services/sessionService";
 import type {
-  AgentState, ControlAction, InterventionPayload, MemoryItem, SessionDetail, SessionEvent,
+  AgentState, ControlAction, DocumentInfo, InterventionPayload, MemoryItem, SessionDetail, SessionEvent,
 } from "../types";
 import { applyAgentEvent, emptyAgentState } from "../utils/agentState";
 
@@ -85,6 +87,7 @@ export default function SessionWorkspace() {
   const [agent, setAgent] = useState<AgentState | null>(null);
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [memory, setMemory] = useState<MemoryItem[]>([]);
+  const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -120,6 +123,7 @@ export default function SessionWorkspace() {
     loadMemory();
     sessionService.events(id).then(mergeEvents).catch(() => undefined);
     sessionService.state(id).then(setAgent).catch(() => undefined);
+    sessionService.documents(id).then(setDocuments).catch(() => undefined);
   }, [id, loadSession, loadMemory, mergeEvents]);
 
   const handleEvent = useCallback(
@@ -139,7 +143,16 @@ export default function SessionWorkspace() {
         }
         loadMemory();
       }
-      if (e.type === "APPROVAL_COMPLETED") loadMemory();
+      if (e.type === "APPROVAL_COMPLETED" || e.type === "CONFLICT_RESOLVED") loadMemory();
+      if (["DOCUMENT_ADDED", "DOCUMENT_READY", "DOCUMENT_FAILED"].includes(e.type) && e.payload.document) {
+        const doc = e.payload.document as DocumentInfo;
+        setDocuments((prev) =>
+          prev.some((d) => d.id === doc.id) ? prev.map((d) => (d.id === doc.id ? doc : d)) : [...prev, doc]
+        );
+      }
+      if (e.type === "DOCUMENT_REMOVED") {
+        setDocuments((prev) => prev.filter((d) => d.id !== e.payload.document_id));
+      }
       setAgent((prev) => (prev ? applyAgentEvent(prev, e) : prev));
       mergeEvents([e]);
     },
@@ -235,6 +248,15 @@ export default function SessionWorkspace() {
 
         {/* Center */}
         <section className="min-w-0 space-y-4">
+          <ConflictCard
+            conflicts={agentState.open_conflicts}
+            isOwner={isOwner}
+            busy={busy !== null}
+            onResolve={(conflictId, winner) =>
+              attempt("resolve", () => sessionService.resolveConflict(id!, conflictId, winner))
+            }
+          />
+
           {pending && (
             <ApprovalCard
               approval={pending}
@@ -293,6 +315,17 @@ export default function SessionWorkspace() {
             constraints={agentState.active_constraints}
             canEdit={canGuide}
             onRemove={(cid) => attempt("remove", () => sessionService.removeConstraint(id!, cid))}
+          />
+
+          <DocumentsPanel
+            documents={documents}
+            canManage={canGuide}
+            onUpload={async (file, meta) => {
+              await sessionService.uploadDocument(id!, file, meta);
+            }}
+            onDelete={(docId) => sessionService.deleteDocument(id!, docId)}
+            onSearch={(q) => sessionService.searchDocuments(id!, q)}
+            onPreview={(docId) => sessionService.documentChunks(id!, docId)}
           />
 
           <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">

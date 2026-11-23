@@ -7,6 +7,7 @@ interface Source {
   source_type?: string;
   preferred?: boolean;
   rejected_by?: string;
+  origin?: string;
 }
 
 export default function ToolActivity({
@@ -99,11 +100,29 @@ export default function ToolActivity({
                     </button>
                   )}
                 </div>
+
                 <p className="text-xs text-slate-500">
                   {s.publisher}
-                  {s.preferred && <span className="ml-2 font-semibold uppercase text-emerald-700">preferred</span>}
-                  {s.simulated && <span className="ml-2 font-semibold uppercase text-amber-700">simulated</span>}
+
+                  {s.preferred && (
+                    <span className="ml-2 font-semibold uppercase text-emerald-700">
+                      preferred
+                    </span>
+                  )}
+
+                  {s.origin === "document" && (
+                    <span className="ml-2 font-semibold uppercase text-brand-700">
+                      uploaded document
+                    </span>
+                  )}
+
+                  {s.simulated && (
+                    <span className="ml-2 font-semibold uppercase text-amber-700">
+                      simulated
+                    </span>
+                  )}
                 </p>
+
               </li>
             ))}
             {rejected.map((s) => (

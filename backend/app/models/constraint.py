@@ -21,6 +21,7 @@ class ConstraintStatus(str, enum.Enum):
     ACTIVE = "ACTIVE"
     REMOVED = "REMOVED"
     # Phase 9 adds SUPERSEDED for constraints replaced by a conflict resolution.
+    SUPERSEDED = "SUPERSEDED"
 
 
 class Constraint(Base):

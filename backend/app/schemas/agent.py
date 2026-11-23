@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.models.session import AgentStatus
 from app.schemas.intervention import ApprovalRead, ConstraintRead, InterventionRead
-
+from app.schemas.conflict import ConflictRead
 
 class AgentStateRead(BaseModel):
     session_id: uuid.UUID
@@ -24,6 +24,7 @@ class AgentStateRead(BaseModel):
     active_constraints: list[ConstraintRead] = []
     human_interventions: list[InterventionRead] = []  # most recent first
     pending_approval: ApprovalRead | None = None
+    open_conflicts: list[ConflictRead] = []
 
 
 class AgentActionRead(BaseModel):
