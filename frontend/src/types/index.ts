@@ -469,3 +469,63 @@ export interface InstructionResult {
   applied: boolean;
   intervention: Intervention | null;
 }
+// ---------- System, records (Phase 15) ----------
+
+export interface SystemStatus {
+  app_name: string;
+  version: string;
+  environment: string;
+  demo_mode: boolean;
+  llm: { provider: string; model: string; ready: boolean; detail: string };
+  embedding_backend: string;
+  embedding_model: string | null;
+  web_search_provider: string;
+  tools_enabled: boolean;
+  enabled_tools: string[];
+  require_final_approval: boolean;
+  nlp_auto_apply: boolean;
+  risk_prediction_enabled: boolean;
+  rate_limit_enabled: boolean;
+  max_upload_mb: number;
+}
+
+export interface NLPStatus {
+  available: boolean;
+  embedder?: string | null;
+  trained_at?: string | null;
+  n_train?: number | null;
+  n_test?: number | null;
+  cv_accuracy?: number | null;
+  held_out_accuracy?: number | null;
+  dataset?: string | null;
+}
+
+export interface SourceLog {
+  id: string;
+  document_id: string | null;
+  step_index: number;
+  title: string;
+  publisher: string;
+  source_type: string | null;
+  origin: string;
+  status: string;
+  rejected_by: string | null;
+  score: number | null;
+  created_at: string;
+}
+
+export interface ToolExecutionRow {
+  id: string;
+  step_index: number;
+  tool_name: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  arguments: Record<string, any>;
+  status: string;
+  output_summary: string | null;
+  error: string | null;
+  simulated: boolean;
+  duration_ms: number;
+  sources_count: number;
+  rejected_count: number;
+  created_at: string;
+}

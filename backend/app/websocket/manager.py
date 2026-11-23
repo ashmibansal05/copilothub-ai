@@ -65,6 +65,14 @@ class ConnectionManager:
                 # Dead socket: drop it. Its own handler will clean up presence.
                 logger.warning("Dropping dead connection %s", conn.connection_id)
                 room.pop(conn.connection_id, None)
+    async def close_room(self, session_id: str, code: int = 4404) -> None:
+        """Disconnect everyone in a session (used when the session is deleted)."""
+        room = self._rooms.pop(session_id, {})
+        for conn in list(room.values()):
+            try:
+                await conn.websocket.close(code=code)
+            except Exception:
+                pass
 
 
 manager = ConnectionManager()

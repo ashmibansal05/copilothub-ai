@@ -2,8 +2,15 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# ============================================================
+# Application Version (Phase 15)
+# ============================================================
+
+APP_VERSION = "1.0.0"
 
 
 class Settings(BaseSettings):
@@ -35,7 +42,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3"
 
-    # OPTIONAL - NOT REQUIRED: any OpenAI-compatible endpoint
+    # OPTIONAL - any OpenAI-compatible endpoint
     optional_api_base_url: str = ""
     optional_api_key: str = ""
     optional_api_model: str = ""
@@ -51,8 +58,12 @@ class Settings(BaseSettings):
     agent_step_timeout_seconds: float = 180.0
     agent_max_runtime_seconds: float = 900.0
     agent_require_final_approval: bool = True
-    agent_max_approval_rounds: int = Field(default=3, ge=1, le=10)
-    agent_max_replans: int = Field(default=3, ge=0, le=10)
+    agent_max_approval_rounds: int = Field(
+        default=3, ge=1, le=10
+    )
+    agent_max_replans: int = Field(
+        default=3, ge=0, le=10
+    )
 
     # ---- RAG (Phase 10) ----
     data_dir: str = "../data"
@@ -67,7 +78,9 @@ class Settings(BaseSettings):
     rag_top_k: int = Field(default=4, ge=1, le=20)
     rag_min_score: float = 0.15
     max_upload_mb: int = Field(default=10, ge=1, le=100)
-    max_documents_per_session: int = Field(default=20, ge=1, le=200)
+    max_documents_per_session: int = Field(
+        default=20, ge=1, le=200
+    )
     rag_max_chunks_per_document: int = Field(
         default=400, ge=1, le=5000
     )
@@ -126,28 +139,45 @@ class Settings(BaseSettings):
         default=5, ge=1, le=50
     )
 
-    # ---- Validators ----
+    # ============================================================
+    # Phase 15: Security and Maintenance
+    # ============================================================
+
+    rate_limit_enabled: bool = True
+    # Enable rate limiting on authentication and sensitive endpoints.
+
+    cleanup_orphans_on_start: bool = False
+    # If enabled, remove uploaded files and indexes belonging
+    # to sessions that no longer exist in the database.
+
+    # ============================================================
+    # Field Validators
+    # ============================================================
 
     @field_validator("embedding_backend")
     @classmethod
     def embedding_backend_must_be_known(cls, value: str) -> str:
         value = value.strip().lower()
+
         if value not in {"sentence_transformers", "hashing"}:
             raise ValueError(
                 "EMBEDDING_BACKEND must be "
                 "'sentence_transformers' or 'hashing'"
             )
+
         return value
 
     @field_validator("web_search_provider")
     @classmethod
     def web_search_provider_must_be_known(cls, value: str) -> str:
         value = value.strip().lower()
+
         if value not in {"demo", "searxng", "duckduckgo"}:
             raise ValueError(
                 "WEB_SEARCH_PROVIDER must be "
                 "'demo', 'searxng' or 'duckduckgo'"
             )
+
         return value
 
     @field_validator("secret_key")
@@ -157,19 +187,48 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SECRET_KEY must be at least 32 characters long"
             )
+
         return value
 
     @field_validator("llm_provider")
     @classmethod
     def llm_provider_must_be_known(cls, value: str) -> str:
         value = value.strip().lower()
+
         if value not in {"ollama", "openai_compatible"}:
             raise ValueError(
                 "LLM_PROVIDER must be 'ollama' or 'openai_compatible'"
             )
+
         return value
 
-    # ---- Properties ----
+    # ============================================================
+    # Phase 15: Production Security Validator
+    # ============================================================
+
+    @model_validator(mode="after")
+    def production_needs_a_real_secret(self):
+        """
+        Prevent the application from starting in production
+        when a known placeholder SECRET_KEY is configured.
+        """
+        if self.environment.strip().lower() == "production":
+            lowered = self.secret_key.lower()
+
+            if (
+                "replace_with" in lowered
+                or "change_me" in lowered
+            ):
+                raise ValueError(
+                    "Set a real SECRET_KEY before running "
+                    "with ENVIRONMENT=production"
+                )
+
+        return self
+
+    # ============================================================
+    # Properties
+    # ============================================================
 
     @property
     def data_path(self) -> Path:

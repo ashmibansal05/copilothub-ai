@@ -23,6 +23,13 @@ import type {
   MLStatus,
   RiskEstimate,
   SessionAnalytics,
+
+  // Phase 15
+  Conflict,
+  NLPStatus,
+  SourceLog,
+  SystemStatus,
+  ToolExecutionRow,
 } from "../types";
 
 export const sessionService = {
@@ -34,10 +41,14 @@ export const sessionService = {
     api.get<SessionSummary[]>("/sessions").then((r) => r.data),
 
   create: (name: string, task: string) =>
-    api.post<SessionDetail>("/sessions", { name, task }).then((r) => r.data),
+    api
+      .post<SessionDetail>("/sessions", { name, task })
+      .then((r) => r.data),
 
   get: (id: string) =>
-    api.get<SessionDetail>(`/sessions/${id}`).then((r) => r.data),
+    api
+      .get<SessionDetail>(`/sessions/${id}`)
+      .then((r) => r.data),
 
   preview: (code: string) =>
     api
@@ -47,16 +58,24 @@ export const sessionService = {
       .then((r) => r.data),
 
   join: (code: string) =>
-    api.post<SessionDetail>("/sessions/join", { code }).then((r) => r.data),
+    api
+      .post<SessionDetail>("/sessions/join", { code })
+      .then((r) => r.data),
 
   events: (id: string) =>
-    api.get<SessionEvent[]>(`/sessions/${id}/events`).then((r) => r.data),
+    api
+      .get<SessionEvent[]>(`/sessions/${id}/events`)
+      .then((r) => r.data),
 
   state: (id: string) =>
-    api.get<AgentState>(`/sessions/${id}/state`).then((r) => r.data),
+    api
+      .get<AgentState>(`/sessions/${id}/state`)
+      .then((r) => r.data),
 
   control: (id: string, action: ControlAction) =>
-    api.post(`/sessions/${id}/${action}`).then((r) => r.data),
+    api
+      .post(`/sessions/${id}/${action}`)
+      .then((r) => r.data),
 
   // ============================================================
   // Phase 7: Human Interventions
@@ -69,7 +88,10 @@ export const sessionService = {
 
   intervene: (id: string, payload: InterventionPayload) =>
     api
-      .post<Intervention>(`/sessions/${id}/interventions`, payload)
+      .post<Intervention>(
+        `/sessions/${id}/interventions`,
+        payload
+      )
       .then((r) => r.data),
 
   // ============================================================
@@ -82,7 +104,9 @@ export const sessionService = {
       .then((r) => r.data),
 
   memory: (id: string) =>
-    api.get<MemoryView>(`/sessions/${id}/memory`).then((r) => r.data),
+    api
+      .get<MemoryView>(`/sessions/${id}/memory`)
+      .then((r) => r.data),
 
   // ============================================================
   // Phase 9: Conflict Resolution
@@ -132,7 +156,11 @@ export const sessionService = {
       .delete(`/sessions/${id}/documents/${documentId}`)
       .then(() => undefined),
 
-  documentChunks: (id: string, documentId: string, limit = 3) =>
+  documentChunks: (
+    id: string,
+    documentId: string,
+    limit = 3
+  ) =>
     api
       .get<ChunkInfo[]>(
         `/sessions/${id}/documents/${documentId}/chunks`,
@@ -161,7 +189,9 @@ export const sessionService = {
 
   report: (id: string, reportId: string) =>
     api
-      .get<ReportDetail>(`/sessions/${id}/reports/${reportId}`)
+      .get<ReportDetail>(
+        `/sessions/${id}/reports/${reportId}`
+      )
       .then((r) => r.data),
 
   // ============================================================
@@ -221,7 +251,10 @@ export const sessionService = {
       }
     );
 
-    const url = URL.createObjectURL(response.data as Blob);
+    const url = URL.createObjectURL(
+      response.data as Blob
+    );
+
     const link = document.createElement("a");
 
     link.href = url;
@@ -240,11 +273,55 @@ export const sessionService = {
 
   sessionAnalytics: (id: string) =>
     api
-      .get<SessionAnalytics>(`/sessions/${id}/analytics`)
+      .get<SessionAnalytics>(
+        `/sessions/${id}/analytics`
+      )
       .then((r) => r.data),
 
   analyticsOverview: () =>
     api
       .get<AnalyticsOverview>("/analytics/overview")
+      .then((r) => r.data),
+
+  // ============================================================
+  // Phase 15: Conflicts and Session Records
+  // ============================================================
+
+  conflicts: (id: string) =>
+    api
+      .get<Conflict[]>(`/sessions/${id}/conflicts`)
+      .then((r) => r.data),
+
+  sources: (id: string) =>
+    api
+      .get<SourceLog[]>(`/sessions/${id}/sources`)
+      .then((r) => r.data),
+
+  toolExecutions: (id: string) =>
+    api
+      .get<ToolExecutionRow[]>(`/sessions/${id}/tools`)
+      .then((r) => r.data),
+
+  // ============================================================
+  // Phase 15: Session Deletion
+  // ============================================================
+
+  deleteSession: (id: string) =>
+    api
+      .delete(`/sessions/${id}`)
+      .then(() => undefined),
+
+  // ============================================================
+  // Phase 15: System and NLP Status
+  // ============================================================
+
+  systemStatus: () =>
+    api
+      .get<SystemStatus>("/system/status")
+      .then((r) => r.data),
+
+  nlpStatus: () =>
+    api
+      .get<NLPStatus>("/nlp/status")
       .then((r) => r.data),
 };

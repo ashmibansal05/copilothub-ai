@@ -1,5 +1,5 @@
 import {
-  BarChart3, Check, Copy, Eye, FileBarChart, Hand, Loader2, MessageSquare, Pause, Play, Plus, ShieldPlus, Square, Wifi, WifiOff,
+  BarChart3, Check, Copy, Eye, FileBarChart, Hand, Loader2, MessageSquare, ListTree, Pause, Play, Plus, ShieldPlus, Square, Wifi, WifiOff,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -19,6 +19,7 @@ import InterventionsPanel from "../components/InterventionsPanel";
 import MemoryPanel from "../components/MemoryPanel";
 import { RoleBadge, StatusBadge } from "../components/StatusBadge";
 import ToolActivity from "../components/ToolActivity";
+import { useToast } from "../contexts/ToastContext";
 import { useSessionSocket } from "../hooks/useSessionSocket";
 import type { ConnectionStatus } from "../hooks/useSessionSocket";
 import { getErrorMessage } from "../services/api";
@@ -87,6 +88,7 @@ function CopyRow({ label, value }: { label: string; value: string }) {
 }
 
 export default function SessionWorkspace() {
+  const toast = useToast();
   const { id } = useParams<{ id: string }>();
   const [session, setSession] = useState<SessionDetail | null>(null);
   const [agent, setAgent] = useState<AgentState | null>(null);
@@ -98,7 +100,6 @@ export default function SessionWorkspace() {
   const [pendingInstruction, setPendingInstruction] = useState<InstructionResult | null>(null);
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   const mergeEvents = useCallback((incoming: SessionEvent[]) => {
@@ -179,12 +180,11 @@ export default function SessionWorkspace() {
 
   const attempt = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key);
-    setActionError(null);
     try {
       await fn();
       loadSession(); // fallback in case the socket is down
     } catch (err) {
-      setActionError(getErrorMessage(err));
+      toast.error(getErrorMessage(err));
     } finally {
       setBusy(null);
     }
@@ -267,6 +267,9 @@ export default function SessionWorkspace() {
           </Link>
           <Link to={`/sessions/${session.id}/analytics`} className="btn-secondary !py-1 text-xs">
             <BarChart3 className="h-3.5 w-3.5" /> Analytics
+          </Link>
+          <Link to={`/sessions/${session.id}/records`} className="btn-secondary !py-1 text-xs">
+            <ListTree className="h-3.5 w-3.5" /> Records
           </Link>
         </div>
       </div>
@@ -400,9 +403,6 @@ export default function SessionWorkspace() {
 
       {/* Bottom action bar */}
       <div className="sticky bottom-3 space-y-2 rounded-2xl border border-slate-200 bg-white/95 p-3 shadow-lg backdrop-blur">
-        {actionError && (
-          <div role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{actionError}</div>
-        )}
         {role === "VIEWER" && (
           <span className="inline-flex items-center gap-2 text-sm text-slate-500">
             <Eye className="h-4 w-4" /> View-only: you can watch but not control the agent.

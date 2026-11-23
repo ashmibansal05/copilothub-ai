@@ -111,6 +111,14 @@ class VectorStoreManager:
             store = SessionVectorStore(path, dim)
             self._stores[key] = store
             return store
+    def drop(self, session_id: uuid.UUID) -> None:
+        """Forget a session's index (and delete its file)."""
+        with self._lock:
+            self._stores.pop(str(session_id), None)
+        try:
+            self._path(session_id).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 vector_stores = VectorStoreManager()

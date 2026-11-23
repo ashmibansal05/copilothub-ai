@@ -4,7 +4,14 @@ from sqlalchemy.orm import Session
 from app.core.security import DUMMY_HASH, hash_password, verify_password
 from app.models.user import User, UserRole
 from app.schemas.user import UserCreate
+from datetime import datetime, timezone
 
+
+def set_password(db: Session, user: User, new_password: str) -> None:
+    """Change the password and revoke every token issued before this moment."""
+    user.hashed_password = hash_password(new_password)
+    user.password_changed_at = datetime.now(timezone.utc)
+    db.commit()
 
 def get_by_email(db: Session, email: str) -> User | None:
     return db.scalar(select(User).where(User.email == email.lower()))
