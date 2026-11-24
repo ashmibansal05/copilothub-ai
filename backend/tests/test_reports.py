@@ -81,13 +81,13 @@ def test_no_report_without_the_switch_and_404_before_one_exists(client, set_brai
     assert client.get(f"/sessions/{sid}/report", headers=headers).status_code == 404
 
 
-def wait_for_reports(client, headers, sid, count, timeout=15.0):
+def wait_for_reports(client, headers, sid, count, timeout=15.0, kind="FINAL"):
     import time
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         found = client.get(f"/sessions/{sid}/reports", headers=headers).json()
-        if len([r for r in found if r["kind"] == "FINAL"]) >= count:
+        if len([r for r in found if r["kind"] == kind]) >= count:
             return found
         time.sleep(0.1)
     raise AssertionError("report was not generated in time")
@@ -103,9 +103,10 @@ def test_generating_on_demand_with_permissions_and_limits(client, set_brain, mon
 
     assert client.post(f"/sessions/{sid}/report/generate", headers=viewer).status_code == 403
     assert client.post(f"/sessions/{sid}/report/generate", headers=editor).status_code == 202
-    wait_for_reports(client, headers, sid, 1)
+    found = wait_for_reports(client, headers, sid, 1, kind="DRAFT")
+    assert any(r["kind"] == "DRAFT" for r in found)
 
-    monkeypatch.setattr(get_settings(), "max_final_reports_per_session", 1)
+    monkeypatch.setattr(get_settings(), "max_reports_per_session", 1)
     assert client.post(f"/sessions/{sid}/report/generate", headers=headers).status_code == 409
 
 

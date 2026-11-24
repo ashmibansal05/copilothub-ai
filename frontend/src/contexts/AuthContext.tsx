@@ -34,7 +34,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // Token expired / rejected somewhere else in the app
   useEffect(() => {
-    const onExpired = () => setUser(null);
+    const onExpired = () => {
+      localStorage.removeItem(TOKEN_KEY);
+      setUser(null);
+    };
     window.addEventListener("auth:expired", onExpired);
     return () => window.removeEventListener("auth:expired", onExpired);
   }, []);

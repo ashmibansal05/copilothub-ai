@@ -386,12 +386,17 @@ class LLMBrain(AgentBrain):
                 "The report reply is not a JSON object"
             )
 
+        def readable(value: object) -> str:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, list):
+                return "\n".join(f"- {item.strip()}" for item in value if isinstance(item, str) and item.strip())
+            # Reject unsupported structures rather than printing Python representations.
+            return ""
+
         return {
-            key: str(data.get(key) or "").strip()
+            key: readable(data.get(key))
             for key in (
-                "executive_summary",
-                "findings",
-                "comparison",
-                "conclusion",
+                "executive_summary", "findings", "comparison", "conclusion"
             )
         }

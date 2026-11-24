@@ -78,7 +78,21 @@ def describe_tools(specs: list[ToolSpec] | tuple[ToolSpec, ...]) -> str:
             kind = prop.get("type", "any")
             if kind == "array":
                 kind = f"array of {prop.get('items', {}).get('type', 'any')}"
+            limits = []
+            if "minimum" in prop:
+                limits.append(f"min {prop['minimum']}")
+            if "maximum" in prop:
+                limits.append(f"max {prop['maximum']}")
+            if "minItems" in prop:
+                limits.append(f"min items {prop['minItems']}")
+            if "maxItems" in prop:
+                limits.append(f"max items {prop['maxItems']}")
+            if "minLength" in prop:
+                limits.append(f"min chars {prop['minLength']}")
+            if "maxLength" in prop:
+                limits.append(f"max chars {prop['maxLength']}")
+            constraints = f" ({', '.join(limits)})" if limits else ""
             optional = "" if name in required else f" (optional, default {prop.get('default')!r})"
-            parts.append(f"{name}: {kind}{optional}")
+            parts.append(f"{name}: {kind}{constraints}{optional}")
         lines.append(f"- {spec.name}({', '.join(parts)}): {spec.description}")
     return "\n".join(lines)

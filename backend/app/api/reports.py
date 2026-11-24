@@ -85,7 +85,7 @@ async def _generate_in_background(session_id: uuid.UUID) -> None:
 async def generate_report(
     ctx: SessionContext = CanGenerate, db: Session = Depends(get_db)
 ) -> MessageResponse:
-    """Build a fresh final report from what the session has produced so far (runs in the background)."""
+    """Build a draft research snapshot without bypassing the final approval gate."""
     sid = ctx.session.id
     done = db.scalar(select(func.count()).select_from(AgentAction).where(
         AgentAction.session_id == sid, AgentAction.action_type == "EVALUATE", AgentAction.success.is_(True))) or 0
@@ -93,14 +93,14 @@ async def generate_report(
         raise HTTPException(status.HTTP_409_CONFLICT, "Nothing to report yet: no step has been completed")
     if report_service.is_generating(sid):
         raise HTTPException(status.HTTP_409_CONFLICT, "A report is already being generated")
-    existing = db.scalar(select(func.count()).select_from(Report).where(Report.session_id == sid, Report.kind == "FINAL")) or 0
-    if existing >= get_settings().max_final_reports_per_session:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"A session can hold at most {get_settings().max_final_reports_per_session} final reports")
+    existing = db.scalar(select(func.count()).select_from(Report).where(Report.session_id == sid, Report.kind == "DRAFT")) or 0
+    if existing >= get_settings().max_reports_per_session:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"A session can hold at most {get_settings().max_reports_per_session} draft reports")
     report_service._generating.add(sid)  # claim it now so a double click cannot start two
     task = asyncio.create_task(_generate_in_background(sid))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
-    return MessageResponse(message="Generating the report. It will appear when it is ready.")
+    return MessageResponse(message="Generating a draft research snapshot. It will appear when ready.")
 
 
 @router.get("/{session_id}/reports/{report_id}", response_model=ReportDetail)

@@ -512,6 +512,13 @@ class AgentOrchestrator:
             len(state["plan"]) + 1, "FINALIZE", None, {}, {"summary": summary[:3000]}, True, None, self._ms(started)
         )
 
+        # Replanning uses the global work budget. Surface the unfinished revised
+        # steps to reviewers instead of silently approving a complete-sounding draft.
+        if state.get("step_index", 0) < len(state.get("plan", [])):
+            missing = state["plan"][state["step_index"]:]
+            summary += ("\n\nINCOMPLETE RESEARCH: The execution budget was reached. "
+                        "These revised-plan steps were not performed: " + "; ".join(missing))
+
         round_no = state.get("approval_round", 0)
         await self._emit(EventType.AGENT_MESSAGE, {
             "kind": "agent", "simulated": self.brain.simulated,
@@ -620,11 +627,19 @@ class AgentOrchestrator:
 
     # ------------------------------------------------------------------ finishing
     async def _complete(self, final: AgentGraphState) -> None:
-        await self._save_state(current_step="Completed", progress=100)
+        skipped = final.get("plan", [])[final.get("step_index", 0):]
+        incomplete = bool(skipped)
+        await self._save_state(
+            current_step="Finished with unfinished steps" if incomplete else "Completed",
+            progress=95 if incomplete else 100,
+        )
         await self._generate_final_report()
         if await self._set_status(AgentStatus.COMPLETED, FINISHABLE):
             await self._emit(EventType.COMPLETED, {
-                "summary": final.get("summary", ""), "confidence": final.get("confidence"),
+                "summary": final.get("summary", ""),
+                "confidence": final.get("confidence"),
+                "incomplete_plan": incomplete,
+                "skipped_steps": skipped,
             })
         await self._record_analytics()
 
@@ -662,7 +677,7 @@ class AgentOrchestrator:
             return
         await self._emit(EventType.AGENT_MESSAGE, {"kind": "system", "text": "Generating the final report..."})
         try:
-            info = await report_service.generate_report(self.session_id, self.brain)
+            info = await report_service.generate_report(self.session_id, self.brain, approved_final=True)
             await self._emit(EventType.REPORT_SAVED, {"report": info})
         except asyncio.CancelledError:
             raise

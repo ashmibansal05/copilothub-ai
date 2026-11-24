@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import json
 import logging
 import time
@@ -54,6 +55,43 @@ def _format_validation_error(exc: ValidationError) -> str:
     return "; ".join(parts)
 
 
+def normalize_known_llm_mistakes(name: str, raw: dict) -> tuple[dict, list[str]]:
+    """Repair only known, low-risk model formatting errors.
+
+    This is NOT a validation bypass; the result must still pass the original
+    Pydantic schema. Do not correct unknown tools or unknown parameters.
+    """
+    args = dict(raw)
+    repairs: list[str] = []
+
+    bounds = {"search_web": "max_results", "retrieve_documents": "k"}
+    bound_name = bounds.get(name)
+    if bound_name and type(args.get(bound_name)) is int and args[bound_name] > 8:
+        repairs.append(f"{bound_name}: {args[bound_name]} -> 8")
+        args[bound_name] = 8
+
+    if name == "compare_sources":
+        for key in ("topics", "criteria"):
+            value = args.get(key)
+            if not isinstance(value, str) or len(value) > 1000:
+                continue
+            stripped = value.strip()
+            if not (stripped.startswith("[") and stripped.endswith("]")):
+                continue
+            try:
+                parsed = json.loads(stripped)
+            except (ValueError, TypeError):
+                try:
+                    parsed = ast.literal_eval(stripped)
+                except (ValueError, SyntaxError, TypeError, RecursionError):
+                    continue
+            if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+                args[key] = parsed
+                repairs.append(f"{key}: encoded string -> JSON array")
+
+    return args, repairs
+
+
 class ToolRegistry:
     """The ONLY way the agent can act. Anything that is not registered here does not exist
     for the model: there is no shell, no arbitrary file access, no URL fetching."""
@@ -92,8 +130,12 @@ class ToolRegistry:
                 return done("REJECTED", error="Tool arguments are too large")
         except (TypeError, ValueError):
             return done("REJECTED", error="Tool arguments are not valid JSON")
+        effective, repairs = normalize_known_llm_mistakes(name, raw_arguments)
+        if repairs:
+            logger.info("Normalized tool %s arguments: %s", label, "; ".join(repairs))
+            preview = preview_arguments(effective)
         try:
-            args = tool.args_model.model_validate(raw_arguments)
+            args = tool.args_model.model_validate(effective)
         except ValidationError as exc:
             return done("REJECTED", error=f"Invalid arguments: {_format_validation_error(exc)}")
 

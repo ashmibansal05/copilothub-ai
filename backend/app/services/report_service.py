@@ -257,10 +257,13 @@ def assemble_sections(inputs: ReportInputs, narrative: dict[str, str], warnings:
         if i.documents else "No documents were uploaded.",
         f"Human constraints recorded: {len(i.constraint_log)}",
     ]
+    methodology.append(f"Unique sources included in this report: {len(i.sources_used)}. Analytics counts source-use records across steps, so its count may be higher.")
     if i.simulated:
         methodology.append("NOTE: some results come from the built-in SIMULATED demo provider. They are placeholders, not real findings.")
 
     findings = _narrative(narrative, "findings")
+    if i.simulated and findings:
+        findings = "*Demo evidence only; factual claims require independent verification.*\n\n" + findings
     step_notes = _bullets([f"{s['step']}: {s['output'][:300]}" for s in i.steps], "No step notes.")
     comparison = _narrative(narrative, "comparison") or "Not available."
     if i.compare_outputs:
@@ -283,12 +286,18 @@ def assemble_sections(inputs: ReportInputs, narrative: dict[str, str], warnings:
     if i.simulated:
         limitations.append("Part of the evidence is simulated demo data.")
     if i.engine and i.engine != "demo" and not any(s.get("origin") in ("document", "web") for s in i.sources_used):
-        limitations.append("No documents or web results were used: the findings come from the model's general knowledge and may be outdated.")
+        limitations.append("No uploaded documents or real web results supported these findings. The model may rely on general knowledge or simulated search placeholders; verify independently.")
     limitations.append("Agent confidence is self-assessed by the model (or simulated in demo mode), not a measured accuracy.")
+    limitations.append("Narrative claims, numbers and citations have not been independently fact-checked. Verify them against real primary evidence before use.")
     if i.sources_rejected:
         limitations.append(f"{len(i.sources_rejected)} source(s) were rejected by human constraints and are not used.")
     if i.tool_problems or i.failed_attempts:
         limitations.append(f"{i.tool_problems} tool call(s) failed or were rejected; {i.failed_attempts} model/tool attempt(s) failed.")
+    if i.plan:
+        completed_step_texts = {s["step"] for s in i.steps}
+        missing = [p for p in i.plan if p not in completed_step_texts]
+        if missing:
+            limitations.append("INCOMPLETE revised plan; steps not executed: " + "; ".join(missing))
     if i.open_conflicts:
         limitations.append(f"{i.open_conflicts} conflict(s) between human instructions were still open.")
     if i.flagged_chunks:
@@ -318,17 +327,21 @@ def render_markdown(title: str, sections: list[dict], engine: str | None) -> str
 
 
 # ----------------------------------------------------------------------- generating
-def _store(session_id: uuid.UUID, inputs: ReportInputs, narrative: dict, warnings: list[str]) -> dict:
+def _store(session_id: uuid.UUID, inputs: ReportInputs, narrative: dict,
+           warnings: list[str], approved_final: bool = False) -> dict:
     sections = assemble_sections(inputs, narrative, warnings + compliance_warnings(inputs.views, narrative))
-    title = f"Research report: {inputs.name}"[:200]
+    kind = "FINAL" if approved_final else "DRAFT"
+    title = (f"Research report: {inputs.name}" if approved_final
+             else f"Research snapshot: {inputs.name}")[:200]
     with db_session.SessionLocal() as db:
         report = Report(
             session_id=session_id, title=title, content=render_markdown(title, sections, inputs.engine),
-            format="markdown", origin="SYSTEM", status="FINAL", kind="FINAL", engine=inputs.engine, sections=sections,
+            format="markdown", origin="SYSTEM", status=kind, kind=kind,
+            engine=inputs.engine, sections=sections,
         )
         db.add(report)
         db.commit()
-        return {"report_id": str(report.id), "title": title, "chars": len(report.content), "kind": "FINAL"}
+        return {"report_id": str(report.id), "title": title, "chars": len(report.content), "kind": kind}
 
 
 def _collect_sync(session_id: uuid.UUID) -> ReportInputs:
@@ -339,7 +352,7 @@ def _collect_sync(session_id: uuid.UUID) -> ReportInputs:
         return collect_inputs(db, session_id)
 
 
-async def generate_report(session_id: uuid.UUID, brain: Any) -> dict:
+async def generate_report(session_id: uuid.UUID, brain: Any, approved_final: bool = False) -> dict:
     """Collect facts, ask the brain for the narrative, assemble, store. Returns a small summary."""
     _generating.add(session_id)
     try:
@@ -356,6 +369,6 @@ async def generate_report(session_id: uuid.UUID, brain: Any) -> dict:
         except Exception as exc:
             logger.warning("Narrative generation failed: %s", exc, exc_info=True)
             warnings.append(f"The narrative could not be generated ({exc.__class__.__name__}); the facts below were assembled from the collected data only.")
-        return await asyncio.to_thread(_store, session_id, inputs, narrative, warnings)
+        return await asyncio.to_thread(_store, session_id, inputs, narrative, warnings, approved_final)
     finally:
         _generating.discard(session_id)
