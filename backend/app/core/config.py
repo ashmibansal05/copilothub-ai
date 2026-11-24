@@ -50,6 +50,16 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 120.0
     llm_temperature: float = 0.2
 
+    # Failover options: disabled unless explicitly configured.
+    llm_fallback_provider: str = "none"  # none | ollama | openai_compatible
+    llm_fallback_ollama_model: str = ""
+    llm_fallback_ollama_base_url: str = ""
+    llm_fallback_api_base_url: str = ""
+    llm_fallback_api_key: str = ""
+    llm_fallback_api_model: str = ""
+    llm_fallback_timeout_seconds: float = Field(default=90.0, ge=5, le=600)
+    llm_serialize_requests: bool = True
+
     # ---- Agent (Phase 5) ----
     agent_max_steps: int = Field(default=8, ge=1, le=30)
     agent_max_retries: int = Field(default=2, ge=0, le=5)

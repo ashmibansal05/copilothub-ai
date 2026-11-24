@@ -330,9 +330,29 @@ def render_markdown(title: str, sections: list[dict], engine: str | None) -> str
 def _store(session_id: uuid.UUID, inputs: ReportInputs, narrative: dict,
            warnings: list[str], approved_final: bool = False) -> dict:
     sections = assemble_sections(inputs, narrative, warnings + compliance_warnings(inputs.views, narrative))
+    from app.services.project_profile import profile_for
+    profile = profile_for(inputs.task)
+    domain = profile["domain"]
+    # A topic such as cloud services for a startup is still RESEARCH work.
+    # Do not relabel its established ten-section research report merely
+    # because domain detection also recognizes a business-related keyword.
+    general_domain = (profile["workflow"] != "RESEARCH"
+                      and domain not in ("Research & Knowledge Work", "Software Development"))
+    if general_domain:
+        titles = {"objective": "Project Objective", "methodology": "Approach and Process",
+                  "findings": "Results and Findings", "evidence": "Supporting Evidence"}
+        for section in sections:
+            section["title"] = titles.get(section["key"], section["title"])
+    # Snapshot full code content into this report at creation time.
+    with db_session.SessionLocal() as code_db:
+        from app.services.code_service import source_section
+        code_section = source_section(code_db, session_id)
+    if code_section:
+        sections.append(code_section)
     kind = "FINAL" if approved_final else "DRAFT"
-    title = (f"Research report: {inputs.name}" if approved_final
-             else f"Research snapshot: {inputs.name}")[:200]
+    prefix = "Project" if general_domain else "Research"
+    title = (f"{prefix} report: {inputs.name}" if approved_final
+             else f"{prefix} snapshot: {inputs.name}")[:200]
     with db_session.SessionLocal() as db:
         report = Report(
             session_id=session_id, title=title, content=render_markdown(title, sections, inputs.engine),

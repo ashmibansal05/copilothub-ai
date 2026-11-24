@@ -18,6 +18,12 @@ def to_markdown(report: Report) -> bytes:
 
 
 def _body_html(body: str) -> str:
+    # Render fenced code as escaped <pre> blocks, preserving all indentation.
+    pieces = re.split(r"(`{3,})[^\n]*\n(.*?)\n?\1", body, flags=re.S)
+    if len(pieces) > 1:
+        return "".join(_body_html(pieces[n]) if n % 3 == 0 else
+                       f"<pre><code>{html.escape(pieces[n])}</code></pre>" if n % 3 == 2 else ""
+                       for n in range(len(pieces)))
     out, bullets = [], []
 
     def flush():
@@ -32,7 +38,11 @@ def _body_html(body: str) -> str:
             else:
                 flush()
                 if line.strip():
-                    out.append(f"<p>{html.escape(line)}</p>")
+                    heading = re.match(r"^#{3,5}\s+(.+)$", line)
+                    if heading:
+                        out.append(f"<h3>{html.escape(heading.group(1))}</h3>")
+                    else:
+                        out.append(f"<p>{html.escape(line)}</p>")
         flush()
     return "".join(out)
 
@@ -47,7 +57,8 @@ def to_html(report: Report) -> bytes:
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         f"<title>{html.escape(report.title)}</title>"
         "<style>body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem;line-height:1.5}"
-        "h1{margin-bottom:.25rem}h2{margin-top:2rem;border-bottom:1px solid #ddd}</style></head>"
+        "h1{margin-bottom:.25rem}h2{margin-top:2rem;border-bottom:1px solid #ddd}"
+        "pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:1rem}</style></head>"
         f"<body><h1>{html.escape(report.title)}</h1>{engine}{parts}</body></html>"
     )
     return page.encode("utf-8")
@@ -62,8 +73,20 @@ def to_docx(report: Report) -> bytes:
         document.add_paragraph(f"Engine: {report.engine}")
     for n, section in enumerate(_sections(report), 1):
         document.add_heading(f"{n}. {section['title']}", level=1)
+        in_code = False
         for line in section["body"].split("\n"):
-            if line.startswith("- "):
+            if re.match(r"^`{3,}", line):
+                in_code = not in_code
+                continue
+            if in_code:
+                paragraph = document.add_paragraph()
+                run = paragraph.add_run(line)
+                run.font.name = "Consolas"
+                from docx.shared import Pt
+                run.font.size = Pt(8)
+            elif re.match(r"^#{3,5}\s+", line):
+                document.add_heading(re.sub(r"^#{3,5}\s+", "", line).strip(), level=2)
+            elif line.startswith("- "):
                 document.add_paragraph(line[2:], style="List Bullet")
             elif line.strip():
                 document.add_paragraph(line)

@@ -58,6 +58,16 @@ class OllamaProvider(LLMProvider):
         try:
             async with self._client() as client:
                 response = await client.post("/api/chat", json=body)
+                # Ollama can abort small-model generations on a token repeat limit.
+                # Retry once with a shorter output budget. If it still fails,
+                # report an unavailable primary to enable configured failover.
+                repeated = response.status_code == 500 and "token repeat limit" in response.text.lower()
+                if repeated:
+                    original = int(options.get("num_predict", 512))
+                    retry_options = dict(options, num_predict=min(512, max(64, original // 2)))
+                    response = await client.post("/api/chat", json={**body, "options": retry_options})
+                    if response.status_code == 500 and "token repeat limit" in response.text.lower():
+                        raise LLMUnavailableError("Ollama repeatedly aborted generation at token repeat limit")
         except httpx.TimeoutException as exc:
             raise LLMUnavailableError(f"Ollama timed out after {self.timeout:.0f}s") from exc
         except httpx.HTTPError as exc:

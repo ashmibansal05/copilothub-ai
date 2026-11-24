@@ -1,0 +1,172 @@
+
+import asyncio
+from datetime import datetime, timezone
+
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.agents.runner import agent_runner
+from app.api.deps import SessionContext
+from app.models.session import AgentStatus
+from app.schemas.session import StateResponse
+from app.services import approval_service, analytics_service, event_service
+from app.websocket.events import EventType
+
+
+# action -> (allowed current states, new state, specific event, system message)
+TRANSITIONS: dict[
+    str,
+    tuple[set[AgentStatus], AgentStatus, EventType | None, str]
+] = {
+    "start": (
+        {AgentStatus.CREATED},
+        AgentStatus.RUNNING,
+        EventType.AGENT_STARTED,
+        "Session started by {user}.",
+    ),
+    "pause": (
+        {AgentStatus.RUNNING, AgentStatus.PLANNING},
+        AgentStatus.PAUSED,
+        EventType.PAUSED,
+        "Paused by {user}. The agent stops after its current step.",
+    ),
+    "resume": (
+        {AgentStatus.PAUSED},
+        AgentStatus.RUNNING,
+        EventType.RESUMED,
+        "Resumed by {user}.",
+    ),
+    "stop": (
+        {
+            AgentStatus.CREATED,
+            AgentStatus.RUNNING,
+            AgentStatus.PLANNING,
+            AgentStatus.PAUSED,
+            AgentStatus.WAITING_FOR_APPROVAL,
+        },
+        AgentStatus.CANCELLED,
+        None,
+        "Stopped by {user}.",
+    ),
+}
+
+
+async def apply_transition(
+    action: str,
+    ctx: SessionContext,
+    db: Session,
+) -> StateResponse:
+    allowed_from, target, event_type, template = TRANSITIONS[action]
+
+    session = ctx.session
+    session_id = session.id
+    previous = session.status
+
+    if previous not in allowed_from:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Cannot {action} a session that is {previous.value}",
+        )
+
+    now = datetime.now(timezone.utc)
+    session.status = target
+
+    if action == "start":
+        session.started_at = now
+
+    if target == AgentStatus.CANCELLED:
+        session.ended_at = now
+
+    db.commit()
+
+    # Tell the agent runner right after the DB change.
+    if action == "pause":
+        from app.api.code import pause_automatic_code
+        pause_automatic_code(session_id)
+        agent_runner.pause(session_id)
+
+    elif action == "resume":
+        from app.api.code import resume_automatic_code
+        resume_automatic_code(session_id)
+        agent_runner.resume(session_id)
+
+    elif action == "stop":
+        from app.api.code import cancel_automatic_code
+        cancel_automatic_code(session_id)
+        await agent_runner.stop(session_id)
+
+    user = ctx.user
+
+    if event_type is not None:
+        await event_service.publish(
+            db,
+            session_id,
+            event_type,
+            {},
+            user,
+        )
+
+    await event_service.publish(
+        db,
+        session_id,
+        EventType.STATUS_CHANGED,
+        {
+            "status": target.value,
+            "previous_status": previous.value,
+        },
+        user,
+    )
+
+    await event_service.publish(
+        db,
+        session_id,
+        EventType.AGENT_MESSAGE,
+        {
+            "kind": "system",
+            "text": template.format(user=user.username),
+        },
+        user,
+    )
+
+    if action == "stop" and approval_service.expire_pending(
+        db, session_id
+    ):
+        await event_service.publish(
+            db,
+            session_id,
+            EventType.APPROVAL_COMPLETED,
+            {"expired": True},
+            user,
+        )
+
+    # -------------------------------------------------------------
+    # Phase 14 - Record session analytics when stopped
+    # -------------------------------------------------------------
+    if action == "stop":
+        try:
+            await asyncio.to_thread(
+                analytics_service.record_session_end,
+                session_id,
+            )
+        except Exception:
+            pass  # Analytics must never block stopping a session.
+
+    if action == "start":
+        from app.services.coding_agent import classify_task
+        from app.api.code import start_automatic_code
+        kind = classify_task(session.task)
+        if kind == "CODING":
+            # Skip the research-only ACT/tool loop for programming tasks.
+            start_automatic_code(session_id, session.task)
+        elif kind == "HYBRID":
+            # Hybrid tasks require both code artifacts and research reasoning.
+            start_automatic_code(session_id, session.task, hybrid=True)
+            await agent_runner.start(session_id)
+        else:
+            await agent_runner.start(session_id)
+
+    return StateResponse(
+        session_id=session_id,
+        status=target,
+        previous_status=previous,
+    )

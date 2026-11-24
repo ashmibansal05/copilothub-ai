@@ -198,6 +198,9 @@ export const sessionService = {
   // Phase 12: Natural-Language Instructions
   // ============================================================
 
+  requestWork: (id: string, text: string) =>
+    api.post<{ message: string; queued: boolean }>(`/sessions/${id}/work-requests`, { text }).then(r => r.data),
+
   instruct: (id: string, text: string) =>
     api
       .post<InstructionResult>(

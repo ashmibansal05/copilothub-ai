@@ -1,5 +1,5 @@
 import {
-  BarChart3, Check, Copy, Eye, FileBarChart, Hand, Loader2, MessageSquare, ListTree, Pause, Play, Plus, ShieldPlus, Square, Wifi, WifiOff,
+  BarChart3, Check, Code2, Copy, Eye, FileBarChart, Hand, Loader2, MessageSquare, ListTree, Pause, Play, Plus, ShieldPlus, Square, Wifi, WifiOff,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -8,9 +8,10 @@ import ApprovalCard from "../components/ApprovalCard";
 import ConflictCard from "../components/ConflictCard";
 import ConstraintsPanel from "../components/ConstraintsPanel";
 import DocumentsPanel from "../components/DocumentsPanel";
-import InstructionBox from "../components/InstructionBox";
+import SimpleRequestBox from "../components/SimpleRequestBox";
 import InstructionConfirmDialog from "../components/InstructionConfirmDialog";
 import ReportsPanel from "../components/ReportsPanel";
+import SourceCodePanel from "../components/SourceCodePanel";
 import RiskCard from "../components/RiskCard";
 import EventTimeline from "../components/EventTimeline";
 import InterventionDialog from "../components/InterventionDialog";
@@ -101,6 +102,7 @@ export default function SessionWorkspace() {
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [codeUpdated, setCodeUpdated] = useState(0);
 
   const mergeEvents = useCallback((incoming: SessionEvent[]) => {
     setEvents((prev) => {
@@ -164,6 +166,7 @@ export default function SessionWorkspace() {
       if (e.type === "DOCUMENT_REMOVED") {
         setDocuments((prev) => prev.filter((d) => d.id !== e.payload.document_id));
       }
+      if (e.type === "CODE_UPDATED") setCodeUpdated(x => x + 1);
       if (e.type === "REPORT_SAVED" && e.payload.report) {
         sessionService.reports(id!).then(setReports).catch(() => undefined);
       }
@@ -177,6 +180,17 @@ export default function SessionWorkspace() {
   );
 
   const { status: connStatus, online } = useSessionSocket(id, handleEvent);
+
+  // Socket updates can be missed across reconnects, background tabs or CPU-heavy
+  // Ollama inference. Poll only while active as a low-cost recovery mechanism.
+  useEffect(() => {
+    if (!id || !session || !["RUNNING", "PLANNING", "PAUSED"].includes(session.status)) return;
+    const timer = window.setInterval(() => {
+      sessionService.state(id).then(setAgent).catch(() => undefined);
+      sessionService.get(id).then(setSession).catch(() => undefined);
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [id, session?.status]);
 
   const attempt = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key);
@@ -256,7 +270,7 @@ export default function SessionWorkspace() {
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-3 shadow-sm">
         <div>
           <h1 className="text-lg font-bold leading-tight">{session.name}</h1>
-          <p className="text-xs text-slate-500">Session ID: {session.id.slice(0, 8)}</p>
+          <p className="text-xs text-slate-500">Shared project workspace</p>
         </div>
         <div className="flex items-center gap-2">
           <StatusBadge status={status} />
@@ -265,6 +279,7 @@ export default function SessionWorkspace() {
           <Link to={`/sessions/${session.id}/report`} className="btn-secondary !py-1 text-xs">
             <FileBarChart className="h-3.5 w-3.5" /> Report
           </Link>
+          <a href="#source-code" className="btn-secondary !py-1 text-xs"><Code2 className="h-3.5 w-3.5" /> Source Code</a>
           <Link to={`/sessions/${session.id}/analytics`} className="btn-secondary !py-1 text-xs">
             <BarChart3 className="h-3.5 w-3.5" /> Analytics
           </Link>
@@ -275,12 +290,16 @@ export default function SessionWorkspace() {
       </div>
 
       <div className="grid gap-4 lg:grid-cols-[280px_1fr_300px]">
-        {/* Left: timeline */}
+        {/* The detailed event stream is optional, not the first thing new users see. */}
         <aside className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 className="mb-3 font-semibold">Activity timeline</h2>
-          <div className="max-h-[720px] overflow-y-auto pr-1">
-            <EventTimeline events={timelineEvents} />
-          </div>
+          <h2 className="mb-2 font-semibold">Project activity</h2>
+          <p className="mb-3 text-xs text-slate-500">Updates about your project appear here.</p>
+          <details>
+            <summary className="cursor-pointer text-sm font-medium text-brand-700">View detailed activity</summary>
+            <div className="mt-3 max-h-[720px] overflow-y-auto pr-1">
+              <EventTimeline events={timelineEvents} />
+            </div>
+          </details>
         </aside>
 
         {/* Center */}
@@ -294,7 +313,7 @@ export default function SessionWorkspace() {
             }
           />
 
-          {pending && (
+          {pending && !(pending.kind === "REVIEW" && pending.payload?.review_type === "CODE") && (
             <ApprovalCard
               approval={pending}
               canDecide={role !== "VIEWER"}
@@ -312,19 +331,26 @@ export default function SessionWorkspace() {
           </div>
 
           <AgentPanel agent={agentState} status={status} />
-          <RiskCard
-            risk={risk}
-            history={events
-              .filter((e) => e.type === "RISK_UPDATED")
-              .map((e) => e.payload.probability as number)}
-          />
-          <ToolActivity
-            events={events}
-            onRejectSource={canGuide ? (publisher) => quick({ type: "REJECT_SOURCE", target: publisher }) : undefined}
-          />
+          <div id="source-code"><SourceCodePanel sessionId={id!} canEdit={role !== "VIEWER"} canApprove={isOwner} onNewVersion={codeUpdated} /></div>
+          <details className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <summary className="cursor-pointer font-medium">Advanced information and tool activity</summary>
+            <div className="mt-4 space-y-4">
+              <RiskCard
+                risk={risk}
+                history={events
+                  .filter((e) => e.type === "RISK_UPDATED")
+                  .map((e) => e.payload.probability as number)}
+              />
+              <ToolActivity
+                events={events}
+                onRejectSource={canGuide ? (publisher) => quick({ type: "REJECT_SOURCE", target: publisher }) : undefined}
+              />
+            </div>
+          </details>
 
-          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-            <h2 className="mb-3 font-semibold">Agent messages</h2>
+          <details className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <summary className="cursor-pointer font-medium">AI messages and technical notes</summary>
+            <div className="mt-3">
             {agentMessages.length === 0 ? (
               <p className="text-sm text-slate-500">Nothing yet. Messages appear here in real time.</p>
             ) : (
@@ -344,12 +370,16 @@ export default function SessionWorkspace() {
                 ))}
               </ul>
             )}
-          </div>
+            </div>
+          </details>
 
-          <div className="grid gap-4 md:grid-cols-2">
-            <InterventionsPanel items={agentState.human_interventions} />
-            <MemoryPanel items={memory} />
-          </div>
+          <details className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <summary className="cursor-pointer font-medium">Project history and AI memory</summary>
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <InterventionsPanel items={agentState.human_interventions} />
+              <MemoryPanel items={memory} />
+            </div>
+          </details>
         </section>
 
         {/* Right */}
@@ -410,12 +440,7 @@ export default function SessionWorkspace() {
         )}
         {role !== "VIEWER" && (
           <>
-            {canGuide && (
-              <InstructionBox
-                onSubmit={(text) => sessionService.instruct(id!, text)}
-                onNeedsConfirmation={setPendingInstruction}
-              />
-            )}
+            {status !== "CANCELLED" && <SimpleRequestBox sessionId={id!} />}
             <div className="flex flex-wrap items-center gap-2">
               <button className="btn-secondary" onClick={() => setDialog("COMMENT")}>
                 <MessageSquare className="h-4 w-4" /> Comment
@@ -437,7 +462,7 @@ export default function SessionWorkspace() {
               )}
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {pending && (
+              {pending && !(pending.kind === "REVIEW" && pending.payload?.review_type === "CODE") && (
                 <>
                   <button className="btn-primary" disabled={busy !== null} onClick={() => quick({ type: "APPROVE" })}>Approve</button>
                   <button className="btn-secondary" disabled={busy !== null} onClick={() => setDialog("REJECT")}>Reject</button>

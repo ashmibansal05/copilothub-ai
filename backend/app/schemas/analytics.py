@@ -33,6 +33,19 @@ class RiskSummary(BaseModel):
     mean_when_not: float | None = None
 
 
+class ProjectMetrics(BaseModel):
+    """Factual workspace measures; not ML-based risk estimates."""
+    files: int = 0
+    versions_saved: int = 0
+    syntax_validated: int = 0
+    validation_failed: int = 0
+    not_validated: int = 0
+    code_reviews: int = 0
+    revisions_requested: int = 0
+    approval_status: str = "NONE"
+    runtime_tested: bool = False
+
+
 class SessionAnalytics(BaseModel):
     session_id: uuid.UUID
     name: str
@@ -72,6 +85,7 @@ class SessionAnalytics(BaseModel):
     sources_by_origin: dict[str, int]
     documents: int
     risk: RiskSummary
+    project_metrics: ProjectMetrics | None = None
 
 
 class SessionRow(BaseModel):

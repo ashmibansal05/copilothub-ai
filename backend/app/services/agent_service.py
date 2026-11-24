@@ -119,6 +119,29 @@ async def recover_orphaned_sessions() -> int:
                 continue
 
             previous = row.status
+            pending = approval_service.get_pending(db, sid)
+            if (previous == AgentStatus.WAITING_FOR_APPROVAL and pending is not None
+                    and (pending.payload or {}).get("review_type") == "CODE"):
+                # The reviewer decision is persisted and needs no live agent task.
+                continue
+            if previous == AgentStatus.PAUSED and pending is None:
+                # Explicitly paused projects remain paused across restarts.
+                continue
+            from app.services.coding_agent import classify_task
+            project_type = classify_task(row.task)
+            if project_type in ("CODING", "HYBRID") and pending is None:
+                # Preserve every version and queued instruction. A user can resume
+                # the interrupted work from the same workspace without a new session.
+                row.status = AgentStatus.PAUSED
+                row.ended_at = None
+                db.commit()
+                await event_service.publish(db, sid, EventType.STATUS_CHANGED,
+                    {"status": AgentStatus.PAUSED.value, "previous_status": previous.value})
+                await event_service.publish(db, sid, EventType.AGENT_MESSAGE, {
+                    "kind": "system",
+                    "text": "The server restarted while AI was working. Your saved files and queued requests are safe. Select Resume to continue.",
+                })
+                continue
             row.status = AgentStatus.FAILED
             row.ended_at = datetime.now(timezone.utc)
 

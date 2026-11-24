@@ -57,7 +57,7 @@ function describe(e: SessionEvent): Described {
         text:
           e.payload.phase === "PLAN"
             ? String(e.payload.step ?? "Planning")
-            : `Step ${e.payload.step_index}/${e.payload.total_steps}: ${e.payload.step}`,
+            : e.payload.step_index == null ? String(e.payload.step ?? "Working") : `Step ${e.payload.step_index}/${e.payload.total_steps}: ${e.payload.step}`,
         color: "text-brand-600",
       };
 

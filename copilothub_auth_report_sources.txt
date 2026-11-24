@@ -1,0 +1,1409 @@
+﻿==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\frontend\src\components\ProtectedRoute.test.tsx
+==================================================
+import { render, screen } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { describe, expect, it, vi } from "vitest";
+import type { User } from "../types";
+import ProtectedRoute from "./ProtectedRoute";
+
+vi.mock("../contexts/AuthContext", () => ({ useAuth: vi.fn() }));
+import { useAuth } from "../contexts/AuthContext";
+
+const user: User = {
+  id: "1", email: "a@example.com", username: "alice", full_name: "Alice", role: "EDITOR",
+  is_active: true, created_at: "2026-01-01T00:00:00Z",
+};
+const auth = (over: { user: User | null; loading: boolean }) =>
+  vi.mocked(useAuth).mockReturnValue({ ...over, login: vi.fn(), register: vi.fn(), logout: vi.fn() });
+
+function renderApp() {
+  return render(
+    <MemoryRouter initialEntries={["/secret"]}>
+      <Routes>
+        <Route path="/login" element={<div>login page</div>} />
+        <Route element={<ProtectedRoute />}>
+          <Route path="/secret" element={<div>secret page</div>} />
+        </Route>
+      </Routes>
+    </MemoryRouter>
+  );
+}
+
+describe("ProtectedRoute", () => {
+  it("shows a spinner while the session is being restored", () => {
+    auth({ user: null, loading: true });
+    renderApp();
+    expect(screen.getByLabelText("Loading")).toBeInTheDocument();
+    expect(screen.queryByText("secret page")).not.toBeInTheDocument();
+  });
+  it("sends anonymous visitors to the login page", () => {
+    auth({ user: null, loading: false });
+    renderApp();
+    expect(screen.getByText("login page")).toBeInTheDocument();
+  });
+  it("lets signed-in users through", () => {
+    auth({ user, loading: false });
+    renderApp();
+    expect(screen.getByText("secret page")).toBeInTheDocument();
+  });
+});
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\frontend\src\contexts\AuthContext.tsx
+==================================================
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
+import { TOKEN_KEY } from "../services/api";
+import { authService } from "../services/authService";
+import type { RegisterPayload, User } from "../types";
+
+interface AuthContextValue {
+  user: User | null;
+  loading: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  register: (payload: RegisterPayload) => Promise<void>;
+  logout: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextValue | undefined>(undefined);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  // Restore session on page load
+  useEffect(() => {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (!token) {
+      setLoading(false);
+      return;
+    }
+    authService
+      .me()
+      .then(setUser)
+      .catch(() => localStorage.removeItem(TOKEN_KEY))
+      .finally(() => setLoading(false));
+  }, []);
+
+  // Token expired / rejected somewhere else in the app
+  useEffect(() => {
+    const onExpired = () => setUser(null);
+    window.addEventListener("auth:expired", onExpired);
+    return () => window.removeEventListener("auth:expired", onExpired);
+  }, []);
+
+  const login = useCallback(async (email: string, password: string) => {
+    const { access_token } = await authService.login(email, password);
+    localStorage.setItem(TOKEN_KEY, access_token);
+    setUser(await authService.me());
+  }, []);
+
+  const register = useCallback(
+    async (payload: RegisterPayload) => {
+      await authService.register(payload);
+      await login(payload.email, payload.password);
+    },
+    [login]
+  );
+
+  const logout = useCallback(async () => {
+    try {
+      await authService.logout();
+    } catch {
+      /* token may already be invalid; ignore */
+    }
+    localStorage.removeItem(TOKEN_KEY);
+    setUser(null);
+  }, []);
+
+  const value = useMemo(
+    () => ({ user, loading, login, register, logout }),
+    [user, loading, login, register, logout]
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth(): AuthContextValue {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used inside <AuthProvider>");
+  return ctx;
+}
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\frontend\src\hooks\useSessionSocket.ts
+==================================================
+
+import { useEffect, useRef, useState } from "react";
+import { TOKEN_KEY, WS_URL } from "../services/api";
+import type { OnlineUser, SessionEvent } from "../types";
+
+export type ConnectionStatus =
+  | "connecting"
+  | "connected"
+  | "disconnected";
+
+/**
+ * Connects to /ws/sessions/{id}, authenticates using
+ * the first message, tracks presence, reconnects with
+ * backoff, and forwards events to onEvent.
+ *
+ * Phase 15:
+ * - Redirect handling when authentication expires.
+ * - Stop reconnection when a session is deleted.
+ */
+export function useSessionSocket(
+  sessionId: string | undefined,
+  onEvent: (event: SessionEvent) => void
+) {
+  const [status, setStatus] =
+    useState<ConnectionStatus>("connecting");
+
+  const [online, setOnline] = useState<OnlineUser[]>([]);
+
+  const onEventRef = useRef(onEvent);
+
+  useEffect(() => {
+    onEventRef.current = onEvent;
+  });
+
+  useEffect(() => {
+    if (!sessionId) return;
+
+    let ws: WebSocket | null = null;
+    let closedByUs = false;
+    let retries = 0;
+
+    let retryTimer:
+      | ReturnType<typeof setTimeout>
+      | undefined;
+
+    let pingTimer:
+      | ReturnType<typeof setInterval>
+      | undefined;
+
+    const connect = () => {
+      setStatus("connecting");
+
+      const socket = new WebSocket(
+        `${WS_URL}/ws/sessions/${sessionId}`
+      );
+
+      ws = socket;
+
+      // --------------------------------------------------
+      // Authenticate after the WebSocket opens
+      // --------------------------------------------------
+
+      socket.onopen = () => {
+        socket.send(
+          JSON.stringify({
+            type: "AUTH",
+            token: localStorage.getItem(TOKEN_KEY),
+          })
+        );
+      };
+
+      // --------------------------------------------------
+      // Handle incoming events
+      // --------------------------------------------------
+
+      socket.onmessage = (msg) => {
+        let event: SessionEvent;
+
+        try {
+          event = JSON.parse(msg.data);
+        } catch {
+          return;
+        }
+
+        switch (event.type) {
+          case "CONNECTED":
+            retries = 0;
+
+            setStatus("connected");
+            setOnline(event.payload.online_users ?? []);
+
+            clearInterval(pingTimer);
+
+            pingTimer = setInterval(() => {
+              if (socket.readyState === WebSocket.OPEN) {
+                socket.send(
+                  JSON.stringify({ type: "PING" })
+                );
+              }
+            }, 25000);
+
+            break;
+
+          case "PONG":
+            return;
+
+          case "USER_JOINED":
+            setOnline((prev) =>
+              prev.some(
+                (u) =>
+                  u.user_id === event.payload.user.user_id
+              )
+                ? prev
+                : [...prev, event.payload.user]
+            );
+            break;
+
+          case "USER_LEFT":
+            setOnline((prev) =>
+              prev.filter(
+                (u) =>
+                  u.user_id !== event.payload.user.user_id
+              )
+            );
+            break;
+        }
+
+        onEventRef.current(event);
+      };
+
+      // --------------------------------------------------
+      // Phase 15: Handle WebSocket disconnection
+      // --------------------------------------------------
+
+      socket.onclose = (e) => {
+        // Ignore stale sockets from earlier effect runs.
+        if (closedByUs) return;
+
+        clearInterval(pingTimer);
+
+        setStatus("disconnected");
+        setOnline([]);
+
+        // 4401: Invalid or expired JWT.
+        // Tell the application's authentication handler
+        // to return the user to the login page.
+        if (e.code === 4401) {
+          window.dispatchEvent(
+            new Event("auth:expired")
+          );
+        }
+
+        // 4401: Invalid/expired authentication token.
+        // 4403: User does not have session permission.
+        // 4404: Session was deleted.
+        // Reconnecting cannot resolve these conditions.
+        if (
+          e.code === 4401 ||
+          e.code === 4403 ||
+          e.code === 4404
+        ) {
+          return;
+        }
+
+        // Retry temporary connection failures.
+        retries += 1;
+
+        retryTimer = setTimeout(
+          connect,
+          Math.min(
+            1000 * 2 ** retries,
+            15000
+          )
+        );
+      };
+    };
+
+    // --------------------------------------------------
+    // Initial connection
+    // --------------------------------------------------
+
+    connect();
+
+    // --------------------------------------------------
+    // Cleanup when session changes or component unmounts
+    // --------------------------------------------------
+
+    return () => {
+      closedByUs = true;
+
+      clearTimeout(retryTimer);
+      clearInterval(pingTimer);
+
+      ws?.close();
+    };
+  }, [sessionId]);
+
+  return {
+    status,
+    online,
+  };
+}
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\frontend\src\layouts\AppLayout.tsx
+==================================================
+import { Bot, LogOut } from "lucide-react";
+import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
+import { useAuth } from "../contexts/AuthContext";
+
+const links = [
+  { to: "/dashboard", label: "Sessions" },
+  { to: "/history", label: "History" },
+  { to: "/analytics", label: "Analytics" },
+  { to: "/settings", label: "Settings" },
+];
+
+const linkClass = ({ isActive }: { isActive: boolean }) =>
+  `text-sm ${isActive ? "font-semibold text-brand-700" : "text-slate-600 hover:text-slate-900"}`;
+
+export default function AppLayout() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  const handleLogout = async () => {
+    await logout();
+    navigate("/login", { replace: true });
+  };
+
+  return (
+    <div className="min-h-screen">
+      <a href="#main" className="skip-link">Skip to main content</a>
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4">
+          <div className="flex items-center gap-6">
+            <Link to="/dashboard" className="flex items-center gap-2 font-bold">
+              <Bot className="h-6 w-6 text-brand-600" /> CoPilotHub AI
+            </Link>
+            <nav aria-label="Main" className="hidden gap-4 sm:flex">
+              {links.map((l) => <NavLink key={l.to} to={l.to} className={linkClass}>{l.label}</NavLink>)}
+            </nav>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="hidden text-right sm:block">
+              <p className="text-sm font-medium leading-tight">{user?.full_name}</p>
+              <p className="text-xs text-slate-500">@{user?.username}</p>
+            </div>
+            <button onClick={handleLogout} className="btn-secondary" aria-label="Log out">
+              <LogOut className="h-4 w-4" />
+              <span className="hidden sm:inline">Logout</span>
+            </button>
+          </div>
+        </div>
+        <nav aria-label="Main (mobile)" className="flex gap-4 overflow-x-auto border-t border-slate-100 px-4 py-2 sm:hidden">
+          {links.map((l) => <NavLink key={l.to} to={l.to} className={linkClass}>{l.label}</NavLink>)}
+        </nav>
+      </header>
+      <main id="main" tabIndex={-1} className="mx-auto max-w-7xl px-4 py-8 outline-none">
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\frontend\src\pages\Settings.tsx
+==================================================
+import { Loader2 } from "lucide-react";
+import { useEffect, useState } from "react";
+import type { FormEvent } from "react";
+import { useNavigate } from "react-router-dom";
+import { useAuth } from "../contexts/AuthContext";
+import { useToast } from "../contexts/ToastContext";
+import { getErrorMessage, TOKEN_KEY } from "../services/api";
+import { authService } from "../services/authService";
+import { sessionService } from "../services/sessionService";
+import type { MLStatus, NLPStatus, SystemStatus } from "../types";
+
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+      <h2 className="mb-4 font-semibold">{title}</h2>
+      {children}
+    </section>
+  );
+}
+
+const yesNo = (v: boolean) => (v ? "on" : "off");
+const pct = (v: number | null | undefined) => (v == null ? "â€“" : `${Math.round(v * 100)}%`);
+
+export default function Settings() {
+  const { user, logout } = useAuth();
+  const toast = useToast();
+  const navigate = useNavigate();
+  const [system, setSystem] = useState<SystemStatus | null>(null);
+  const [nlp, setNlp] = useState<NLPStatus | null>(null);
+  const [ml, setMl] = useState<MLStatus | null>(null);
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    sessionService.systemStatus().then(setSystem).catch(() => undefined);
+    sessionService.nlpStatus().then(setNlp).catch(() => undefined);
+    sessionService.mlStatus().then(setMl).catch(() => undefined);
+  }, []);
+
+  const changePassword = async (e: FormEvent) => {
+    e.preventDefault();
+    if (next !== confirm) return toast.error("The new passwords do not match.");
+    setBusy(true);
+    try {
+      const token = await authService.changePassword(current, next);
+      localStorage.setItem(TOKEN_KEY, token.access_token); // every OTHER device is now signed out
+      setCurrent(""); setNext(""); setConfirm("");
+      toast.success("Password changed. Other devices were signed out.");
+    } catch (err) {
+      toast.error(getErrorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!user) return null;
+  const rows: [string, string][] = system
+    ? [
+        ["Version", `${system.app_name} ${system.version} (${system.environment})`],
+        ["Agent engine", system.demo_mode ? "Demo mode (simulated web results, scripted agent)" : `${system.llm.provider} / ${system.llm.model}`],
+        ["Language model", system.llm.ready ? "ready" : `not ready: ${system.llm.detail}`],
+        ["Embeddings", system.embedding_backend === "hashing" ? "lexical hashing (offline fallback)" : `${system.embedding_model}`],
+        ["Web search", system.web_search_provider === "demo" ? "demo (simulated)" : system.web_search_provider],
+        ["Agent tools", system.tools_enabled ? system.enabled_tools.join(", ") : "off (single-shot steps)"],
+        ["Final approval required", yesNo(system.require_final_approval)],
+        ["Free-text auto-apply", yesNo(system.nlp_auto_apply)],
+        ["Risk prediction", yesNo(system.risk_prediction_enabled)],
+        ["Rate limiting", yesNo(system.rate_limit_enabled)],
+        ["Upload limit", `${system.max_upload_mb} MB`],
+      ]
+    : [];
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-6">
+      <h1 className="text-2xl font-bold">Settings</h1>
+
+      <Card title="Your account">
+        <dl className="grid gap-3 text-sm sm:grid-cols-2">
+          <div><dt className="text-xs text-slate-500">Name</dt><dd className="font-medium">{user.full_name}</dd></div>
+          <div><dt className="text-xs text-slate-500">Username</dt><dd className="font-medium">@{user.username}</dd></div>
+          <div><dt className="text-xs text-slate-500">Email</dt><dd className="font-medium">{user.email}</dd></div>
+          <div><dt className="text-xs text-slate-500">Member since</dt><dd className="font-medium">{new Date(user.created_at).toLocaleDateString()}</dd></div>
+        </dl>
+        <button className="btn-secondary mt-4" onClick={async () => { await logout(); navigate("/login", { replace: true }); }}>
+          Sign out
+        </button>
+      </Card>
+
+      <Card title="Change password">
+        <form onSubmit={changePassword} className="space-y-3">
+          <div>
+            <label htmlFor="pw-current" className="mb-1 block text-sm font-medium">Current password</label>
+            <input id="pw-current" type="password" className="input" required autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
+          </div>
+          <div>
+            <label htmlFor="pw-new" className="mb-1 block text-sm font-medium">New password</label>
+            <input id="pw-new" type="password" className="input" required minLength={8} autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} />
+            <p className="mt-1 text-xs text-slate-500">At least 8 characters with a letter and a number.</p>
+          </div>
+          <div>
+            <label htmlFor="pw-confirm" className="mb-1 block text-sm font-medium">Repeat the new password</label>
+            <input id="pw-confirm" type="password" className="input" required autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+          </div>
+          <button type="submit" disabled={busy} className="btn-primary">
+            {busy && <Loader2 className="h-4 w-4 animate-spin" />} Change password
+          </button>
+        </form>
+      </Card>
+
+      <Card title="System status">
+        {!system ? <p className="text-sm text-slate-500">Loadingâ€¦</p> : (
+          <dl className="grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
+            {rows.map(([k, v]) => (
+              <div key={k}><dt className="text-xs text-slate-500">{k}</dt><dd className="break-words font-medium">{v}</dd></div>
+            ))}
+          </dl>
+        )}
+      </Card>
+
+      <Card title="Machine-learning components">
+        <ul className="space-y-3 text-sm">
+          <li>
+            <p className="font-medium">Instruction classifier (free text â†’ intervention)</p>
+            {nlp?.available ? (
+              <p className="text-slate-600">
+                Trained on {nlp.n_train} examples ({nlp.embedder}). Cross-validation accuracy {pct(nlp.cv_accuracy)}, held-out accuracy {pct(nlp.held_out_accuracy)}.
+                <span className="block text-xs text-slate-500">{nlp.dataset}</span>
+              </p>
+            ) : <p className="text-slate-500">Not trained yet. It trains itself on first use, or run <code>python -m app.nlp.train</code>.</p>}
+          </li>
+          <li>
+            <p className="font-medium">Intervention-risk predictor</p>
+            {ml?.available ? (
+              <p className="text-slate-600">
+                Selected model: {ml.selected_model?.replace(/_/g, " ")} Â· data: <strong>{ml.data_source}</strong> ({ml.n_rows} rows).
+                {ml.warning && <span className="mt-1 block rounded bg-amber-50 px-2 py-1 text-xs text-amber-900">{ml.warning}</span>}
+              </p>
+            ) : <p className="text-slate-500">Not trained yet. Run <code>python -m app.ml.train</code>.</p>}
+          </li>
+        </ul>
+      </Card>
+    </div>
+  );
+}
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\frontend\src\services\api.ts
+==================================================
+import axios from "axios";
+
+export const TOKEN_KEY = "copilothub_token";
+export const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+export const WS_URL = API_URL.replace(/^http/, "ws");
+
+export const api = axios.create({
+  baseURL: API_URL,
+  timeout: 15000,
+});
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const isLogin = error.config?.url?.includes("/auth/login");
+    if (
+      axios.isAxiosError(error) &&
+      error.response?.status === 401 &&
+      !isLogin &&
+      localStorage.getItem(TOKEN_KEY)
+    ) {
+      localStorage.removeItem(TOKEN_KEY);
+      window.dispatchEvent(new Event("auth:expired"));
+    }
+    return Promise.reject(error);
+  }
+);
+
+/** Turns any axios/FastAPI error into a readable message. */
+export function getErrorMessage(err: unknown): string {
+  if (axios.isAxiosError(err)) {
+    if (!err.response) return "Cannot reach the server. Is the backend running?";
+    const detail = err.response.data?.detail;
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      return detail
+        .map((d: { msg?: string }) => (d.msg ?? "Invalid input").replace(/^Value error, /, ""))
+        .join(". ");
+    }
+    return `Request failed (${err.response.status})`;
+  }
+  return "Something went wrong";
+}
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\frontend\src\services\authService.ts
+==================================================
+
+import { api } from "./api";
+import type {
+  HealthResponse,
+  RegisterPayload,
+  TokenResponse,
+  User,
+} from "../types";
+
+export const authService = {
+  // Register a new user
+  register: (payload: RegisterPayload) =>
+    api
+      .post<User>("/auth/register", payload)
+      .then((r) => r.data),
+
+  // Authenticate user and receive JWT token
+  login: (email: string, password: string) =>
+    api
+      .post<TokenResponse>("/auth/login", {
+        email,
+        password,
+      })
+      .then((r) => r.data),
+
+  // Get currently authenticated user
+  me: () =>
+    api
+      .get<User>("/auth/me")
+      .then((r) => r.data),
+
+  // Logout current user
+  logout: () =>
+    api.post("/auth/logout"),
+
+  // Check backend health
+  health: () =>
+    api
+      .get<HealthResponse>("/health")
+      .then((r) => r.data),
+
+  // ========================================================
+  // Phase 15: Change Password
+  // ========================================================
+
+  changePassword: (
+    current_password: string,
+    new_password: string
+  ) =>
+    api
+      .post<TokenResponse>("/auth/change-password", {
+        current_password,
+        new_password,
+      })
+      .then((r) => r.data),
+};
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\frontend\src\types\index.ts
+==================================================
+export type UserRole = "OWNER" | "EDITOR" | "VIEWER";
+
+export interface User {
+  id: string;
+  email: string;
+  username: string;
+  full_name: string;
+  role: UserRole;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface TokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+}
+
+export interface RegisterPayload {
+  email: string;
+  username: string;
+  full_name: string;
+  password: string;
+}
+
+export interface HealthResponse {
+  status: string;
+  app: string;
+  environment: string;
+  demo_mode: boolean;
+}
+
+// ---------- Sessions (Phase 3) ----------
+
+export type AgentStatus =
+  | "CREATED"
+  | "PLANNING"
+  | "RUNNING"
+  | "WAITING_FOR_APPROVAL"
+  | "PAUSED"
+  | "COMPLETED"
+  | "FAILED"
+  | "CANCELLED";
+
+export interface Member {
+  user_id: string;
+  username: string;
+  full_name: string;
+  role: UserRole;
+  joined_at: string;
+}
+
+export interface SessionSummary {
+  id: string;
+  name: string;
+  task: string;
+  status: AgentStatus;
+  my_role: UserRole;
+  member_count: number;
+  owner_username: string;
+  created_at: string;
+}
+
+export interface SessionDetail extends SessionSummary {
+  owner_id: string;
+  members: Member[];
+  editor_code: string | null;
+  viewer_code: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+}
+
+export interface InvitePreview {
+  session_name: string;
+  task: string;
+  owner_name: string;
+  role: UserRole;
+  already_member: boolean;
+  session_id: string | null;
+}
+
+export type ControlAction = "start" | "pause" | "resume" | "stop";
+
+// ---------- Real-time events (Phase 4) ----------
+
+export interface SessionEvent {
+  id: string;
+  session_id: string;
+  type: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  payload: Record<string, any>;
+  user_id: string | null;
+  created_at: string;
+}
+
+export interface OnlineUser {
+  user_id: string;
+  username: string;
+  role: UserRole;
+}
+// ---------- Agent (Phase 5) ----------
+
+// ---------- Interventions, constraints, memory (Phases 7-8) ----------
+
+export type InterventionType =
+  | "APPROVE" | "REJECT" | "CORRECT" | "PAUSE" | "RESUME" | "MODIFY_TASK"
+  | "ADD_INFORMATION" | "ADD_CONSTRAINT" | "REMOVE_CONSTRAINT" | "REJECT_SOURCE"
+  | "CHANGE_SOURCE" | "REQUEST_REVIEW" | "COMMENT" | "RESOLVE_CONFLICT";
+
+export type Priority = "LOW" | "MEDIUM" | "HIGH";
+export type ConstraintAction = "EXCLUDE_SOURCE" | "INCLUDE_SOURCE" | "PREFER_SOURCE" | "INSTRUCTION";
+
+export interface Intervention {
+  id: string;
+  session_id: string;
+  user_id: string | null;
+  username: string | null;
+  type: InterventionType;
+  content: string | null;
+  target: string | null;
+  priority: Priority;
+  status: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  details: Record<string, any>;
+  result: string | null;
+  created_at: string;
+}
+
+export interface Constraint {
+  id: string;
+  session_id: string;
+  type: "CONSTRAINT";
+  action: ConstraintAction;
+  target: string;
+  description: string;
+  priority: Priority;
+  status: string;
+  created_by: string | null;
+  created_by_username: string | null;
+  created_at: string;
+}
+
+export interface PendingApproval {
+  id: string;
+  kind: "FINAL_REPORT" | "REVIEW";
+  status: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  payload: Record<string, any>;
+  created_at: string;
+}
+
+export interface MemoryItem {
+  id: string;
+  kind: "FACT" | "CORRECTION" | "DECISION" | "REJECTED_SOURCE" | "APPROVED_SOURCE";
+  key: string | null;
+  content: string;
+  importance: number;
+  author: string | null;
+  created_at: string;
+}
+
+export interface MemoryView {
+  constraints: Constraint[];
+  items: MemoryItem[];
+}
+
+export interface InterventionPayload {
+  type: InterventionType;
+  content?: string;
+  target?: string;
+  priority?: Priority;
+  action?: ConstraintAction;
+  constraint_id?: string;
+  origin_text?: string;
+}
+
+export interface AgentState {
+  session_id: string;
+  status: AgentStatus;
+  current_task: string;
+  current_step: string | null;
+  step_index: number; // steps completed so far
+  total_steps: number;
+  progress: number;
+  confidence: number | null;
+  engine: string | null;
+  plan: string[];
+  recent_actions: Record<string, unknown>[];
+  tool_results: Record<string, unknown>[];
+  active_constraints: Constraint[];
+  human_interventions: Intervention[]; // most recent first
+  pending_approval: PendingApproval | null;
+    open_conflicts: Conflict[];
+}
+// ---------- Conflicts (Phase 9) ----------
+
+export interface ConflictSide {
+  constraint_id: string;
+  action: ConstraintAction;
+  target: string;
+  description: string;
+  priority: Priority;
+  created_by_username: string | null;
+  created_by_role: string | null;
+  still_active: boolean;
+}
+
+export interface Conflict {
+  id: string;
+  session_id: string;
+  kind: "SOURCE_POLICY";
+  status: "OPEN" | "RESOLVED";
+  constraint_a: ConflictSide; // the older instruction
+  constraint_b: ConflictSide; // the newer instruction
+  requires_resolution: boolean;
+  rule_applied: string;
+  provisional: string | null;
+  suggested_winner_id: string | null;
+  resolution: "KEEP_A" | "KEEP_B" | "REMOVE_BOTH" | "AUTO_CLOSED" | null;
+  resolution_note: string | null;
+  resolved_by_username: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+// ---------- Documents / RAG (Phase 10) ----------
+
+export interface DocumentInfo {
+  id: string;
+  session_id: string;
+  title: string;
+  filename: string;
+  source_name: string;
+  source_type: string;
+  status: "PROCESSING" | "READY" | "FAILED";
+  error: string | null;
+  size_bytes: number;
+  page_count: number | null;
+  chunk_count: number;
+  flagged_chunks: number;
+  embedding_backend: string | null;
+  uploaded_by_username: string | null;
+  created_at: string;
+}
+
+export interface ChunkInfo {
+  id: string;
+  chunk_index: number;
+  page: number | null;
+  text: string;
+  flagged: boolean;
+}
+
+export interface SearchHit {
+  chunk_id: string;
+  document_id: string;
+  title: string;
+  source_name: string;
+  source_type: string;
+  page: number | null;
+  text: string;
+  score: number;
+  preferred: boolean;
+}
+// ---------- Reports (Phase 11) ----------
+
+export interface ReportSection {
+  key: string;
+  title: string;
+  body: string;
+}
+
+export interface ReportSummary {
+  id: string;
+  title: string;
+  format: string;
+  origin: string;
+  status: string;
+  kind: "DRAFT" | "FINAL";
+  engine: string | null;
+  chars: number;
+  created_at: string;
+}
+
+export interface ReportDetail extends ReportSummary {
+  content: string;
+  sections: ReportSection[] | null;
+}
+
+// ---------- ML risk (Phase 13) ----------
+
+export interface RiskFactor {
+  feature: string;
+  label: string;
+  effect: number;
+  value: number;
+}
+
+export interface RiskEstimate {
+  available: boolean;
+  reason?: string | null;
+  probability?: number | null;
+  level?: "LOW" | "MEDIUM" | "HIGH" | null;
+  model?: string | null;
+  data_source?: string | null;
+  step_index?: number | null;
+  factors: RiskFactor[];
+  warning?: string | null;
+}
+
+export interface ModelScores {
+  cv_roc_auc_mean: number;
+  cv_roc_auc_std: number;
+  test: { accuracy: number; precision: number; recall: number; f1: number; roc_auc: number };
+}
+
+export interface MLStatus {
+  available: boolean;
+  data_source?: string | null;
+  trained_at?: string | null;
+  selected_model?: string | null;
+  selection_rule?: string | null;
+  n_rows?: number | null;
+  n_test?: number | null;
+  positive_rate?: number | null;
+  models: Record<string, ModelScores>;
+  baseline?: { accuracy: number; precision: number; recall: number; f1: number; roc_auc: number; rule: string } | null;
+  warning?: string | null;
+}
+
+// ---------- Analytics (Phase 14) ----------
+
+export interface ToolStat { tool: string; calls: number; failures: number }
+export interface RiskSummary {
+  data_source: string | null;
+  n: number;
+  mean: number | null;
+  max: number | null;
+  last: number | null;
+  history: { step_index: number; probability: number; level: string }[];
+  observed_n: number;
+  mean_when_intervened: number | null;
+  mean_when_not: number | null;
+}
+
+export interface SessionAnalytics {
+  session_id: string;
+  name: string;
+  status: string;
+  engine: string | null;
+  duration_seconds: number | null;
+  steps_planned: number;
+  steps_completed: number;
+  confidence_series: { step_index: number; confidence: number }[];
+  avg_confidence: number | null;
+  final_confidence: number | null;
+  min_confidence: number | null;
+  interventions_total: number;
+  comments: number;
+  corrective: number;
+  interventions_by_type: Record<string, number>;
+  interventions_by_user: Record<string, number>;
+  tool_calls: number;
+  tool_failures: number;
+  tool_failure_rate: number | null;
+  tools: ToolStat[];
+  failed_attempts: number;
+  recovered: boolean;
+  approvals_requested: number;
+  approvals_approved: number;
+  approvals_rejected: number;
+  approval_rate: number | null;
+  conflicts_total: number;
+  conflicts_open: number;
+  conflicts_resolved: number;
+  sources_used: number;
+  sources_rejected: number;
+  source_rejection_rate: number | null;
+  documents: number;
+  risk: RiskSummary;
+}
+
+export interface ResearchGroup {
+  label: string;
+  sessions: number;
+  completion_rate: number | null;
+  avg_duration_seconds: number | null;
+  avg_final_confidence: number | null;
+}
+
+export interface AnalyticsOverview {
+  sessions_total: number;
+  sessions_completed: number;
+  sessions_failed: number;
+  sessions_cancelled: number;
+  sessions_active: number;
+  success_rate: number | null;
+  avg_duration_seconds: number | null;
+  interventions_total: number;
+  interventions_corrective: number;
+  interventions_per_session: number | null;
+  interventions_by_type: Record<string, number>;
+  avg_confidence: number | null;
+  avg_final_confidence: number | null;
+  confidence_histogram: { label: string; count: number }[];
+  tool_calls: number;
+  tool_failures: number;
+  tool_failure_rate: number | null;
+  tools: ToolStat[];
+  approvals_requested: number;
+  approvals_approved: number;
+  approvals_rejected: number;
+  approval_rate: number | null;
+  conflicts_total: number;
+  conflicts_open: number;
+  sources_used: number;
+  sources_rejected: number;
+  source_rejection_rate: number | null;
+  prediction: RiskSummary;
+  research: {
+    task_completion_rate: number | null;
+    human_correction_rate: number | null;
+    incorrect_actions_per_session: number | null;
+    agent_recovery_rate: number | null;
+    avg_time_to_completion_seconds: number | null;
+    source_rejection_rate: number | null;
+    tool_failure_rate: number | null;
+    conflicts_per_session: number | null;
+    groups: ResearchGroup[];
+    notes: string;
+  };
+  recent_sessions: {
+    id: string;
+    name: string;
+    status: string;
+    created_at: string;
+    duration_seconds: number | null;
+    interventions: number;
+    corrective: number;
+    tool_failures: number;
+    conflicts: number;
+    final_confidence: number | null;
+  }[];
+}
+
+// ---------- Free-text instructions (Phase 12) ----------
+
+export interface InstructionProposal {
+  type: InterventionType;
+  content: string | null;
+  target: string | null;
+  action: ConstraintAction | null;
+  priority: Priority | null;
+  constraint_id: string | null;
+  candidates: { id: string; description: string }[];
+}
+
+export interface InstructionResult {
+  text: string;
+  intent: string;
+  confidence: number;
+  method: "model" | "rule";
+  alternatives: { intent: string; confidence: number }[];
+  proposal: InstructionProposal;
+  allowed: boolean;
+  needs_confirmation: boolean;
+  reason: string | null;
+  note: string | null;
+  applied: boolean;
+  intervention: Intervention | null;
+}
+// ---------- System, records (Phase 15) ----------
+
+export interface SystemStatus {
+  app_name: string;
+  version: string;
+  environment: string;
+  demo_mode: boolean;
+  llm: { provider: string; model: string; ready: boolean; detail: string };
+  embedding_backend: string;
+  embedding_model: string | null;
+  web_search_provider: string;
+  tools_enabled: boolean;
+  enabled_tools: string[];
+  require_final_approval: boolean;
+  nlp_auto_apply: boolean;
+  risk_prediction_enabled: boolean;
+  rate_limit_enabled: boolean;
+  max_upload_mb: number;
+}
+
+export interface NLPStatus {
+  available: boolean;
+  embedder?: string | null;
+  trained_at?: string | null;
+  n_train?: number | null;
+  n_test?: number | null;
+  cv_accuracy?: number | null;
+  held_out_accuracy?: number | null;
+  dataset?: string | null;
+}
+
+export interface SourceLog {
+  id: string;
+  document_id: string | null;
+  step_index: number;
+  title: string;
+  publisher: string;
+  source_type: string | null;
+  origin: string;
+  status: string;
+  rejected_by: string | null;
+  score: number | null;
+  created_at: string;
+}
+
+export interface ToolExecutionRow {
+  id: string;
+  step_index: number;
+  tool_name: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  arguments: Record<string, any>;
+  status: string;
+  output_summary: string | null;
+  error: string | null;
+  simulated: boolean;
+  duration_ms: number;
+  sources_count: number;
+  rejected_count: number;
+  created_at: string;
+}
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\backend\app\api\auth.py
+==================================================
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_current_user
+from app.api.limits import client_ip, enforce, ip_limit, user_limit
+from app.core.security import create_access_token, verify_password
+from app.db.session import get_db
+from app.models.user import User
+from app.schemas.auth import ChangePasswordRequest, LoginRequest, MessageResponse, TokenResponse
+from app.schemas.user import UserCreate, UserRead
+from app.services import user_service
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post(
+    "/register", response_model=UserRead, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(ip_limit("register", 10, 60))],
+)
+def register(data: UserCreate, db: Session = Depends(get_db)) -> User:
+    if user_service.get_by_email(db, data.email):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Email is already registered")
+    if user_service.get_by_username(db, data.username):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Username is already taken")
+    try:
+        return user_service.create_user(db, data)
+    except IntegrityError:  # race between check and insert
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Email or username already exists")
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)) -> TokenResponse:
+    enforce("login-ip", client_ip(request), 20, 60)  # slows down guessing from one machine...
+    enforce("login-email", data.email.lower(), 8, 60)  # ...and guessing against one account
+    user = user_service.authenticate(db, data.email, data.password)
+    if user is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token, expires_in = create_access_token(str(user.id))
+    return TokenResponse(access_token=token, expires_in=expires_in)
+
+
+@router.get("/me", response_model=UserRead)
+def me(current_user: User = Depends(get_current_user)) -> User:
+    return current_user
+
+
+@router.post("/logout", response_model=MessageResponse)
+def logout(_: User = Depends(get_current_user)) -> MessageResponse:
+    # JWTs are stateless: the client deletes its token. To revoke every token at once, change the password.
+    return MessageResponse(message="Logged out")
+
+
+@router.post(
+    "/change-password", response_model=TokenResponse,
+    dependencies=[Depends(user_limit("change-password", 5, 60))],
+)
+def change_password(
+    data: ChangePasswordRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TokenResponse:
+    """Changes the password and invalidates ALL older tokens. Returns a fresh token for this device."""
+    if not verify_password(data.current_password, user.hashed_password):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Current password is incorrect")
+    if data.current_password == data.new_password:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The new password must be different")
+    user_service.set_password(db, user, data.new_password)
+    token, expires_in = create_access_token(str(user.id))
+    return TokenResponse(access_token=token, expires_in=expires_in)
+
+==================================================
+FILE: C:\Users\bansa\Desktop\copilothub-ai\backend\app\api\reports.py
+==================================================
+import asyncio
+import logging
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.agents.runner import agent_runner
+from app.api.deps import SessionContext, get_session_context, require_session_role
+from app.core.config import get_settings
+from app.db import session as db_session
+from app.db.session import get_db
+from app.models.agent import AgentAction
+from app.models.report import Report
+from app.models.user import UserRole
+from app.schemas.auth import MessageResponse
+from app.schemas.tools import ReportDetail, ReportSummary
+from app.services import event_service, report_service
+from app.services.report_export import EXPORTERS, safe_filename
+from app.websocket.events import EventType
+
+logger = logging.getLogger("copilothub.report")
+router = APIRouter(prefix="/sessions", tags=["reports"])
+CanGenerate = Depends(require_session_role(UserRole.OWNER, UserRole.EDITOR))
+_tasks: set[asyncio.Task] = set()
+
+
+def _summary(r: Report) -> ReportSummary:
+    return ReportSummary(
+        id=r.id, title=r.title, format=r.format, origin=r.origin, status=r.status, kind=r.kind,
+        engine=r.engine, chars=len(r.content), created_at=r.created_at,
+    )
+
+
+def _detail(r: Report) -> ReportDetail:
+    return ReportDetail(**_summary(r).model_dump(), content=r.content, sections=r.sections)
+
+
+def _get(db: Session, ctx: SessionContext, report_id: uuid.UUID) -> Report:
+    report = db.scalar(select(Report).where(Report.id == report_id, Report.session_id == ctx.session.id))
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Report not found")
+    return report
+
+
+@router.get("/{session_id}/reports", response_model=list[ReportSummary])
+async def list_reports(
+    ctx: SessionContext = Depends(get_session_context), db: Session = Depends(get_db)
+) -> list[ReportSummary]:
+    rows = db.scalars(select(Report).where(Report.session_id == ctx.session.id).order_by(Report.created_at)).all()
+    return [_summary(r) for r in rows]
+
+
+@router.get("/{session_id}/report", response_model=ReportDetail)
+async def get_final_report(
+    ctx: SessionContext = Depends(get_session_context), db: Session = Depends(get_db)
+) -> ReportDetail:
+    """The most recent FINAL research report of the session."""
+    report = db.scalar(
+        select(Report).where(Report.session_id == ctx.session.id, Report.kind == "FINAL")
+        .order_by(Report.created_at.desc()).limit(1)
+    )
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No final report has been generated yet")
+    return _detail(report)
+
+
+async def _generate_in_background(session_id: uuid.UUID) -> None:
+    try:
+        brain, _ = await agent_runner.brain_factory()
+        info = await report_service.generate_report(session_id, brain)
+        with db_session.SessionLocal() as db:
+            await event_service.publish(db, session_id, EventType.REPORT_SAVED, {"report": info})
+    except Exception as exc:
+        logger.exception("Report generation failed")
+        with db_session.SessionLocal() as db:
+            await event_service.publish(
+                db, session_id, EventType.AGENT_MESSAGE,
+                {"kind": "warning", "text": f"The report could not be generated ({exc.__class__.__name__})."},
+            )
+
+
+@router.post("/{session_id}/report/generate", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
+async def generate_report(
+    ctx: SessionContext = CanGenerate, db: Session = Depends(get_db)
+) -> MessageResponse:
+    """Build a fresh final report from what the session has produced so far (runs in the background)."""
+    sid = ctx.session.id
+    done = db.scalar(select(func.count()).select_from(AgentAction).where(
+        AgentAction.session_id == sid, AgentAction.action_type == "EVALUATE", AgentAction.success.is_(True))) or 0
+    if done == 0:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Nothing to report yet: no step has been completed")
+    if report_service.is_generating(sid):
+        raise HTTPException(status.HTTP_409_CONFLICT, "A report is already being generated")
+    existing = db.scalar(select(func.count()).select_from(Report).where(Report.session_id == sid, Report.kind == "FINAL")) or 0
+    if existing >= get_settings().max_final_reports_per_session:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"A session can hold at most {get_settings().max_final_reports_per_session} final reports")
+    report_service._generating.add(sid)  # claim it now so a double click cannot start two
+    task = asyncio.create_task(_generate_in_background(sid))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    return MessageResponse(message="Generating the report. It will appear when it is ready.")
+
+
+@router.get("/{session_id}/reports/{report_id}", response_model=ReportDetail)
+async def get_report(
+    report_id: uuid.UUID, ctx: SessionContext = Depends(get_session_context), db: Session = Depends(get_db)
+) -> ReportDetail:
+    return _detail(_get(db, ctx, report_id))
+
+
+@router.get("/{session_id}/reports/{report_id}/download")
+async def download_report(
+    report_id: uuid.UUID,
+    format: str = Query("md", pattern="^(md|html|docx)$"),
+    ctx: SessionContext = Depends(get_session_context),
+    db: Session = Depends(get_db),
+) -> Response:
+    report = _get(db, ctx, report_id)
+    media_type, render = EXPORTERS[format]
+    return Response(
+        content=render(report), media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename(report.title)}.{format}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+

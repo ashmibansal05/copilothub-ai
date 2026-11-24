@@ -1,0 +1,168 @@
+"""Deliberate, bounded code generation using the existing LLM provider.
+No generated code is executed by the backend.
+"""
+import json
+import re
+from typing import Awaitable, Callable
+from app.llm.utils import extract_json
+from app.services.code_service import CodeError, MAX_FILES, safe_path, validate_static, language_for
+
+LANG_EXT = {"python":"py", "c++":"cpp", "cpp":"cpp", "java":"java",
+ "javascript":"js", "typescript":"ts", "html":"html", "css":"css", "sql":"sql"}
+
+def classify_task(task: str) -> str:
+    """Classify task descriptions without calling the model (safe fallback)."""
+    t = (task or "").lower()
+    research = bool(re.search(r"\b(research|compare|comparison|investigate|analy[sz]e|survey|literature review|find sources)\b", t))
+    coding = bool(re.search(
+        r"\b(source code|code|coding|program|programming|script|implement|implementation|"
+        r"develop|website|web app|application|software|api|frontend|backend|"
+        r"build|create|generate|write)\b", t
+    )) and bool(re.search(
+        r"\b(code|program|programming|script|implement|implementation|develop|"
+        r"app|application|website|software|api|frontend|backend|project|calculator|"
+        r"python|java|javascript|typescript|react|fastapi|django|flask|html|css|sql)\b", t
+    ))
+    return "HYBRID" if coding and research else "CODING" if coding else "RESEARCH"
+
+
+def clean_content(text: str) -> str:
+    t = text.strip()
+    m = re.fullmatch(r"```[^\n]*\n(.*?)\n?```", t, re.S)
+    return (m.group(1) if m else t).rstrip() + "\n"
+
+# Some smaller local models ignore "only output this file" and return code for
+# multiple languages in a single answer. Never silently persist mixed languages.
+_FENCED = re.compile(r"```([^\n`]*)\n(.*?)\n?```", re.S)
+
+def clean_file_output(path: str, raw: str) -> str:
+    """Extract only the requested file, or reject ambiguous multi-file output."""
+    language = language_for(path)
+    aliases = {"cpp": {"cpp", "c++", "cc", "cxx"},
+               "python": {"python", "py"},
+               "javascript": {"javascript", "js", "jsx"},
+               "typescript": {"typescript", "ts", "tsx"},
+               "markdown": {"markdown", "md"}}
+    accepted = aliases.get(language, {language})
+    text = raw.strip()
+    fenced = list(_FENCED.finditer(text))
+    if fenced:
+        # Only accept a fenced answer if there is no additional source outside
+        # the fences, and every block belongs to the requested language.
+        outside = _FENCED.sub("", text).strip()
+        blocks = [(m.group(1).strip().lower().split()[0] if m.group(1).strip() else "",
+                   m.group(2)) for m in fenced]
+        matches = [value for tag, value in blocks if tag in accepted]
+        if len(blocks) == 1 and (blocks[0][0] in accepted or not blocks[0][0]) and not outside:
+            text = blocks[0][1]
+        elif len(matches) == 1 and not outside:
+            text = matches[0]
+        else:
+            raise CodeError(f"Model mixed multiple files or explanations in {path}")
+    if "```" in text:
+        raise CodeError(f"Unclosed code fence or mixed-language response in {path}")
+    content = text.rstrip() + "\n"
+    validation, details = validate_static(path, content)
+    if validation == "VALIDATION_FAILED":
+        raise CodeError(f"Invalid generated file {path}: {details}")
+    return content
+
+async def file_plan(provider, task: str, existing: list[dict], instruction: str = "") -> list[str]:
+    """Ask for a bounded file manifest. A simple-program fallback handles poor JSON models."""
+    prompt = ("Generate a SMALL, coherent set of source files for this coding task. "
+      "Return ONLY JSON of the form {\"files\":[\"calculator.py\",\"calculator.cpp\"]}. "
+      "No prose, no code. At most 12 files. Include README.md and only required dependency manifests. "
+      "The paths must be relative and use forward slashes. "
+      "For revisions, include ONLY affected files. "
+      f"Task: {task}\nChange request: {instruction}\nExisting paths: {[e['path'] for e in existing]}")
+    # Common single-file coding requests should not require an extra model call
+    # to discover obvious filenames. This matters on CPU-only Ollama installations.
+    if not existing and not instruction and re.search(r"\bcalculator\b", task, re.I):
+        t = task.lower()
+        filenames = []
+        if "c++" in t or re.search(r"\bcpp\b", t):
+            filenames.append("calculator.cpp")
+        if "python" in t:
+            filenames.append("calculator.py")
+        if filenames:
+            return filenames + ["README.md"]
+    result = None
+    try:
+        raw = await provider.generate([{"role":"user", "content":prompt}], json_mode=True, max_tokens=450)
+        data = extract_json(raw)
+        result = data.get("files") if isinstance(data, dict) else None
+    except Exception:
+        pass
+    if not isinstance(result, list) or not result:
+        names = []
+        t = (task + " " + instruction).lower()
+        for label, ext in LANG_EXT.items():
+            if label in t and (label != "java" or "javascript" not in t):
+                names.append("main." + ext)
+        result = names or ([existing[0]["path"]] if existing else ["main.py"])
+        result.append("README.md")
+    out = []
+    for f in result[:12]:
+        if not isinstance(f, str): continue
+        try: path = safe_path(f)
+        except CodeError: continue
+        if path not in out: out.append(path)
+    if not out: raise CodeError("No safe file paths generated")
+    if len(out) + len(existing) > MAX_FILES: raise CodeError("Too many files")
+    return out
+
+async def generate_files(provider, task: str, existing: list[dict], instruction: str = "",
+                         on_progress=None, on_file=None):
+    """Generate bounded files, optionally delivering each one immediately.
+
+    on_progress(stage, index, total, path) and on_file(path, content, index, total)
+    are async callbacks; omitting them preserves the original API for tests.
+    """
+    if on_progress:
+        await on_progress("planning", 0, 0, "")
+    paths = await file_plan(provider, task, existing, instruction)
+    previous = {f["path"]: f for f in existing}
+    generated = {}
+    total = len(paths)
+    for index, path in enumerate(paths, 1):
+        if on_progress:
+            await on_progress("generating", index, total, path)
+        if path == "README.md" and re.search(r"\bcalculator\b", task, re.I) and not existing and not instruction:
+            # A straightforward README needs no additional LLM inference.
+            commands = []
+            if "calculator.cpp" in paths:
+                commands += ["C++: g++ calculator.cpp -o calculator", "Run: ./calculator (Windows: .\\calculator.exe)"]
+            if "calculator.py" in paths:
+                commands += ["Python: python calculator.py"]
+            content = "# Calculator\n\n" + task.strip() + "\n\n## Run\n\n" + "\n\n".join(commands) + "\n"
+        else:
+            context = "\n".join(f"{x['path']}: {x['content'][:1200]}" for x in existing[:8])[:5500]
+            prompt = ("You are a careful software engineer. Output ONLY the complete CONTENT of the requested file "
+              "(no markdown fences, no explanation). Produce runnable coherent code, no placeholders or ellipses. "
+              "Use standard libraries for small programs, handle errors, and align with other files. "
+              f"Project task: {task}\nRevision request: {instruction or 'Initial generation'}\n"
+              f"CURRENT FILE: {path}\nExisting related files (truncated context):\n{context}\n"
+              f"Previous version of this file:\n{previous.get(path, {}).get('content', '')[:7000]}\n"
+              f"Recently generated files:\n{str(generated)[-3000:]}\n"
+              "Produce the COMPLETE file now, without a prose introduction.")
+            # Retry a malformed file once, without re-generating already saved files.
+            # A failure remains visible; never mark mixed or invalid code as ready.
+            for attempt in range(2):
+                raw = await provider.generate([{"role":"user", "content":prompt}],
+                                              max_tokens=1800 if len(paths) <= 3 else 3000,
+                                              temperature=0.1)
+                try:
+                    content = clean_file_output(path, raw)
+                    break
+                except CodeError as exc:
+                    if attempt:
+                        raise
+                    prompt += ("\nYour previous response was invalid: " + str(exc) +
+                               ". Return ONLY the requested file, with no other language or file.")
+        if not content.strip():
+            raise CodeError(f"Model returned an empty source file: {path}")
+        generated[path] = content
+        if on_file:
+            await on_file(path, content, index, total)
+    return generated
+

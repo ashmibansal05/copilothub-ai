@@ -65,8 +65,29 @@ export default function SessionAnalytics() {
         </dl>
       </Card>
 
+      {a.project_metrics && <Card title="Project files and review">
+        <p className="mb-3 text-sm text-slate-600">These are actual project records, not AI risk predictions.</p>
+        <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-3">
+          {([
+            ["Files", a.project_metrics.files],
+            ["Saved versions", a.project_metrics.versions_saved],
+            ["Syntax checks passed", a.project_metrics.syntax_validated],
+            ["Unvalidated files", a.project_metrics.not_validated],
+            ["Validation failures", a.project_metrics.validation_failed],
+            ["Code review requests", a.project_metrics.code_reviews],
+            ["Requested revisions", a.project_metrics.revisions_requested],
+            ["Latest approval", a.project_metrics.approval_status.toLowerCase()],
+            ["Runtime testing", a.project_metrics.runtime_tested ? "Recorded" : "Not performed"],
+          ] as [string, string | number][]).map(([k, v]) => (
+            <div key={k}><dt className="text-xs text-slate-500">{k}</dt><dd className="font-medium">{v}</dd></div>
+          ))}
+        </dl>
+      </Card>}
+
       <Card title="Confidence and predicted intervention risk, by step">
-        {series.length === 0 ? <p className="py-6 text-center text-sm text-slate-500">No completed steps yet.</p> : (
+        {series.length === 0 ? <p className="py-6 text-center text-sm text-slate-500">
+          {a.project_metrics ? "No validated risk prediction is available for this coding workflow. The project metrics above show what was actually recorded." : "No research evaluation data recorded for this session."}
+        </p> : (
           <>
             <ResponsiveContainer width="100%" height={260}>
               <LineChart data={series}>

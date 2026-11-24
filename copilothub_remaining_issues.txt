@@ -1,0 +1,943 @@
+﻿================ FILE: backend\app\services\report_service.py ================
+"""The final research report.
+
+FACTS are assembled by code straight from the database (objective, methodology, evidence,
+human decisions, limitations, sources) so a language model cannot invent them. Only four
+NARRATIVE sections (executive summary, findings, comparison, conclusion) are written by the
+agent's brain, from the collected material, and are then checked against the constraints."""
+
+import asyncio
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, joinedload
+
+from app.core.config import get_settings
+from app.db import session as db_session
+from app.models.agent import AgentAction, AgentState
+from app.models.approval import Approval, ApprovalStatus
+from app.models.conflict import Conflict
+from app.models.constraint import Constraint
+from app.models.document import Document, DocumentStatus
+from app.models.intervention import Intervention, InterventionType
+from app.models.memory import MemoryItem, MemoryKind
+from app.models.report import Report
+from app.models.session import AgentSession
+from app.models.source import Source
+from app.models.tool_execution import ToolExecution
+from app.models.user import User
+from app.services.conflict_manager import ConflictManager
+from app.services.constraint_manager import ConstraintManager, ConstraintView, target_keys
+from app.services.readers import describe_constraint
+
+logger = logging.getLogger("copilothub.report")
+
+SECTION_TITLES = [
+    ("executive_summary", "Executive Summary"), ("objective", "Research Objective"),
+    ("methodology", "Methodology"), ("findings", "Findings"), ("comparison", "Comparison"),
+    ("evidence", "Evidence"), ("human_decisions", "Human Decisions"), ("limitations", "Limitations"),
+    ("conclusion", "Conclusion"), ("sources", "Sources"),
+]
+
+LABELS = {
+    "APPROVE": "approved", "REJECT": "rejected", "CORRECT": "corrected the agent", "PAUSE": "paused",
+    "RESUME": "resumed", "MODIFY_TASK": "changed the task", "ADD_INFORMATION": "added information",
+    "ADD_CONSTRAINT": "added a constraint", "REMOVE_CONSTRAINT": "removed a constraint",
+    "REJECT_SOURCE": "rejected a source", "CHANGE_SOURCE": "changed a source",
+    "REQUEST_REVIEW": "requested a review", "RESOLVE_CONFLICT": "resolved a conflict",
+}
+
+_generating: set[uuid.UUID] = set()
+
+
+class ReportLimitError(Exception):
+    """Too many final reports for this session."""
+
+
+def is_generating(session_id: uuid.UUID) -> bool:
+    return session_id in _generating
+
+
+@dataclass
+class ReportInputs:
+    name: str
+    task: str
+    original_task: str
+    engine: str | None
+    plan: list[str]
+    steps: list[dict]  # {step_index, step, output, sources, rejected_sources}
+    tool_counts: dict[str, int]
+    tool_problems: int
+    simulated: bool
+    documents: list[dict]
+    flagged_chunks: int
+    views: list[ConstraintView]
+    constraint_log: list[str]
+    interventions: list[str]
+    approvals: list[str]
+    conflicts: list[str]
+    notes: list[str]
+    sources_used: list[dict]
+    sources_rejected: list[dict]
+    draft_summary: str | None
+    compare_outputs: list[str]
+    open_conflicts: int
+    failed_attempts: int
+    steps_completed: int
+    history: list[dict] = field(default_factory=list)  # shaped like the agent's observations
+
+
+# ----------------------------------------------------------------------- collecting
+def _dedupe(sources: list[dict]) -> list[dict]:
+    seen: set[tuple] = set()
+    out = []
+    for s in sources:
+        key = (s.get("title"), s.get("publisher"), s.get("document_id") or s.get("url"))
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
+
+def collect_inputs(db: Session, session_id: uuid.UUID) -> ReportInputs:
+    session = db.get(AgentSession, session_id)
+    views = ConstraintManager.to_views(ConflictManager.effective_constraints(db, session_id))
+
+    plan_row = db.scalar(select(AgentAction).where(
+        AgentAction.session_id == session_id, AgentAction.action_type == "PLAN", AgentAction.success.is_(True)
+    ).order_by(AgentAction.created_at.desc()).limit(1))
+    plan = list((plan_row.output_data or {}).get("plan", [])) if plan_row else []
+
+    steps_by_text: dict[str, dict] = {}
+    for a in db.scalars(select(AgentAction).where(
+        AgentAction.session_id == session_id, AgentAction.action_type == "TOOL_CALL"
+    ).order_by(AgentAction.created_at)).all():
+        out = a.output_data or {}
+        steps_by_text[(a.input_data or {}).get("step", f"step {a.step_index}")] = {
+            "step_index": a.step_index, "step": (a.input_data or {}).get("step", f"step {a.step_index}"),
+            "output": out.get("output", ""), "sources": out.get("sources", []),
+            "rejected_sources": out.get("rejected_sources", []),
+        }
+    steps = list(steps_by_text.values())
+
+    # Re-apply TODAY's constraints to everything collected, exactly as the agent does.
+    history, all_used, newly_rejected = [], [], []
+    for s in steps:
+        allowed, rejected = ConstraintManager.filter_sources(views, s["sources"])
+        history.append({"step_index": s["step_index"], "step": s["step"], "finding": s["output"],
+                        "success": True, "sources": allowed})
+        all_used += allowed
+        newly_rejected += rejected + s["rejected_sources"]
+    rejected_rows = db.scalars(select(Source).where(Source.session_id == session_id, Source.status == "REJECTED")).all()
+    rejected_all = _dedupe(newly_rejected + [
+        {"title": r.title, "publisher": r.publisher, "rejected_by": r.rejected_by} for r in rejected_rows
+    ])
+    used = _dedupe(all_used)
+    used_keys = {(s.get("title"), s.get("publisher")) for s in used}
+    rejected_all = [r for r in rejected_all if (r.get("title"), r.get("publisher")) not in used_keys]
+
+    tool_rows = db.execute(select(ToolExecution.tool_name, ToolExecution.status, ToolExecution.simulated).where(
+        ToolExecution.session_id == session_id)).all()
+    tool_counts: dict[str, int] = {}
+    for name, _, _ in tool_rows:
+        tool_counts[name] = tool_counts.get(name, 0) + 1
+    simulated = any(sim for _, _, sim in tool_rows) or bool(db.scalar(
+        select(func.count()).select_from(Source).where(Source.session_id == session_id, Source.origin == "SIMULATED")))
+    compare_outputs = [o for (o,) in db.execute(select(ToolExecution.output_summary).where(
+        ToolExecution.session_id == session_id, ToolExecution.tool_name == "compare_sources",
+        ToolExecution.status == "SUCCESS").order_by(ToolExecution.created_at.desc()).limit(2)).all() if o]
+
+    interventions, original_task = [], session.task
+    for iv in db.scalars(select(Intervention).options(joinedload(Intervention.user)).where(
+        Intervention.session_id == session_id, Intervention.type != InterventionType.COMMENT
+    ).order_by(Intervention.created_at)).all():
+        who = f"@{iv.user.username}" if iv.user else "someone"
+        detail = iv.content or iv.target or ""
+        interventions.append(f"{who} {LABELS.get(iv.type.value, iv.type.value.lower())}" + (f": {detail[:200]}" if detail else ""))
+        if iv.type == InterventionType.MODIFY_TASK and original_task == session.task:
+            original_task = (iv.details or {}).get("old_task", original_task)
+
+    constraint_log = []
+    for c in db.scalars(select(Constraint).options(joinedload(Constraint.creator)).where(
+        Constraint.session_id == session_id).order_by(Constraint.created_at)).all():
+        who = f"@{c.creator.username}" if c.creator else "someone"
+        constraint_log.append(f"[{c.priority.value}] {describe_constraint(c.action.value, c.target)} ({who}, {c.status.value.lower()})")
+
+    approvals = []
+    for a in db.scalars(select(Approval).where(Approval.session_id == session_id, Approval.status != ApprovalStatus.PENDING)
+                        .order_by(Approval.created_at)).all():
+        who = db.get(User, a.decided_by) if a.decided_by else None
+        what = "Final draft" if a.kind.value == "FINAL_REPORT" else "Review request"
+        approvals.append(f"{what}: {a.status.value.lower()}" + (f" by @{who.username}" if who else "") + (f" ({a.note})" if a.note else ""))
+
+    conflicts, open_conflicts = [], 0
+    for c in db.scalars(select(Conflict).where(Conflict.session_id == session_id).order_by(Conflict.created_at)).all():
+        read = ConflictManager.to_read(db, c)
+        outcome = (read.resolution.value.lower().replace("_", " ") if read.resolution else "open")
+        open_conflicts += int(read.resolution is None)
+        conflicts.append(f"\"{read.constraint_a.description}\" vs \"{read.constraint_b.description}\": {outcome}")
+
+    notes = [
+        f"[{m.kind.value.lower()}{' by ' + m.author if m.author else ''}] {m.content}"
+        for m in db.scalars(select(MemoryItem).where(
+            MemoryItem.session_id == session_id, MemoryItem.is_active.is_(True),
+            MemoryItem.kind.in_([MemoryKind.CORRECTION, MemoryKind.FACT, MemoryKind.DECISION])
+        ).order_by(MemoryItem.created_at.desc()).limit(10)).all()
+    ]
+    docs = db.scalars(select(Document).where(Document.session_id == session_id, Document.status == DocumentStatus.READY)).all()
+    finalize = db.scalar(select(AgentAction).where(AgentAction.session_id == session_id, AgentAction.action_type == "FINALIZE")
+                         .order_by(AgentAction.created_at.desc()).limit(1))
+    state = db.scalar(select(AgentState).where(AgentState.session_id == session_id))
+    evaluated = db.scalar(select(func.count(func.distinct(AgentAction.step_index))).where(
+        AgentAction.session_id == session_id, AgentAction.action_type == "EVALUATE", AgentAction.success.is_(True))) or 0
+
+    return ReportInputs(
+        name=session.name, task=session.task, original_task=original_task, engine=state.engine if state else None,
+        plan=plan, steps=steps, tool_counts=tool_counts,
+        tool_problems=sum(1 for _, status, _ in tool_rows if status != "SUCCESS"), simulated=simulated,
+        documents=[{"title": d.title, "source_name": d.source_name, "source_type": d.source_type, "chunks": d.chunk_count} for d in docs],
+        flagged_chunks=sum(d.flagged_chunks for d in docs), views=views, constraint_log=constraint_log,
+        interventions=interventions, approvals=approvals, conflicts=conflicts, notes=notes,
+        sources_used=used, sources_rejected=rejected_all,
+        draft_summary=(finalize.output_data or {}).get("summary") if finalize else None,
+        compare_outputs=compare_outputs, open_conflicts=open_conflicts, failed_attempts=db.scalar(
+            select(func.count()).select_from(AgentAction).where(AgentAction.session_id == session_id, AgentAction.success.is_(False))) or 0,
+        steps_completed=evaluated, history=history,
+    )
+
+
+# ----------------------------------------------------------------------- assembling
+def _bullets(lines: list[str], empty: str = "None.") -> str:
+    return "\n".join(f"- {line}" for line in lines) if lines else empty
+
+
+def _source_line(s: dict) -> str:
+    extras = [s.get("source_type"), "uploaded document" if s.get("origin") == "document" else None,
+              "simulated" if s.get("simulated") else None,
+              f"relevance {s['score']}" if s.get("score") is not None else None,
+              f"page {s['page']}" if s.get("page") else None, s.get("url")]
+    detail = ", ".join(str(e) for e in extras if e)
+    return f"{s.get('title', 'Untitled')} â€” {s.get('publisher', 'unknown')}" + (f" ({detail})" if detail else "")
+
+
+def _narrative(narrative: dict, key: str) -> str:
+    return str(narrative.get(key) or "").strip()[:2500]
+
+
+def compliance_warnings(views: list[ConstraintView], narrative: dict[str, str]) -> list[str]:
+    """If the written text mentions a source a human excluded, say so in the report."""
+    text = " ".join(narrative.values()).lower()
+    warnings = []
+    for v in views:
+        if v.action != "EXCLUDE_SOURCE":
+            continue
+        if any(re.search(rf"\b{re.escape(k)}\b", text) for k in target_keys(v.target)):
+            warnings.append(f"The narrative text mentions \"{v.target}\", which a human excluded as a source. Please review it before relying on it.")
+    return warnings
+
+
+def assemble_sections(inputs: ReportInputs, narrative: dict[str, str], warnings: list[str]) -> list[dict]:
+    i = inputs
+    summary = _narrative(narrative, "executive_summary") or i.draft_summary or "No summary is available."
+
+    objective = [f"Task: {i.task}", f"Session: {i.name}"]
+    if i.original_task != i.task:
+        objective.append(f"The task was changed during the run. Original task: {i.original_task}")
+
+    tools = (", ".join(f"{name} Ã—{n}" for name, n in sorted(i.tool_counts.items()))
+             if i.tool_counts else "none (single-step reasoning without the tool loop)")
+    methodology = [
+        f"Engine: {i.engine or 'unknown'}",
+        f"Plan ({len(i.plan)} steps): " + "; ".join(f"{n}. {s}" for n, s in enumerate(i.plan, 1)) if i.plan else "Plan: not recorded",
+        f"Tools used: {tools}" + (f" ({i.tool_problems} call(s) failed or were rejected)" if i.tool_problems else ""),
+        ("Uploaded documents: " + "; ".join(f"{d['title']} ({d['source_name']}, {d['source_type']})" for d in i.documents))
+        if i.documents else "No documents were uploaded.",
+        f"Human constraints recorded: {len(i.constraint_log)}",
+    ]
+    if i.simulated:
+        methodology.append("NOTE: some results come from the built-in SIMULATED demo provider. They are placeholders, not real findings.")
+
+    findings = _narrative(narrative, "findings")
+    step_notes = _bullets([f"{s['step']}: {s['output'][:300]}" for s in i.steps], "No step notes.")
+    comparison = _narrative(narrative, "comparison") or "Not available."
+    if i.compare_outputs:
+        comparison += "\n\nEvidence matrix from the uploaded documents:\n" + i.compare_outputs[0][:1500]
+
+    evidence = _bullets([_source_line(s) for s in i.sources_used], "No sources were used.")
+    approved = [f"{c}" for c in i.constraint_log if "explicitly allowed" in c]
+    if approved:
+        evidence += "\n\nSources a human explicitly approved:\n" + _bullets(approved)
+
+    decisions = "\n\n".join([
+        "Interventions:\n" + _bullets(i.interventions, "No human interventions."),
+        "Approvals:\n" + _bullets(i.approvals, "No approvals were requested."),
+        "Conflicts between instructions:\n" + _bullets(i.conflicts, "None."),
+        "Constraints (history):\n" + _bullets(i.constraint_log, "None."),
+        "Corrections and facts remembered:\n" + _bullets(i.notes, "None."),
+    ])
+
+    limitations = [f"Narrative sections were written by: {i.engine or 'unknown'}. Verify claims against the evidence."]
+    if i.simulated:
+        limitations.append("Part of the evidence is simulated demo data.")
+    if i.engine and i.engine != "demo" and not any(s.get("origin") in ("document", "web") for s in i.sources_used):
+        limitations.append("No documents or web results were used: the findings come from the model's general knowledge and may be outdated.")
+    limitations.append("Agent confidence is self-assessed by the model (or simulated in demo mode), not a measured accuracy.")
+    if i.sources_rejected:
+        limitations.append(f"{len(i.sources_rejected)} source(s) were rejected by human constraints and are not used.")
+    if i.tool_problems or i.failed_attempts:
+        limitations.append(f"{i.tool_problems} tool call(s) failed or were rejected; {i.failed_attempts} model/tool attempt(s) failed.")
+    if i.open_conflicts:
+        limitations.append(f"{i.open_conflicts} conflict(s) between human instructions were still open.")
+    if i.flagged_chunks:
+        limitations.append(f"{i.flagged_chunks} document passage(s) looked like injected instructions and were excluded.")
+    limitations += warnings
+
+    sources = ("Sources used:\n" + ("\n".join(f"[{n}] {_source_line(s)}" for n, s in enumerate(i.sources_used, 1)) or "None.")
+               + "\n\nSources rejected (not used):\n"
+               + _bullets([f"{s.get('title', '')} â€” {s.get('publisher', '')}" + (f": rejected by constraint \"{s['rejected_by']}\"" if s.get("rejected_by") else "")
+                           for s in i.sources_rejected], "None."))
+
+    bodies = {
+        "executive_summary": summary, "objective": "\n".join(objective), "methodology": _bullets(methodology),
+        "findings": (findings + "\n\n" if findings else "") + "Step notes:\n" + step_notes,
+        "comparison": comparison, "evidence": evidence, "human_decisions": decisions,
+        "limitations": _bullets(limitations), "conclusion": _narrative(narrative, "conclusion") or "Not available.",
+        "sources": sources,
+    }
+    return [{"key": k, "title": t, "body": bodies[k]} for k, t in SECTION_TITLES]
+
+
+def render_markdown(title: str, sections: list[dict], engine: str | None) -> str:
+    parts = [f"# {title}", f"*Generated by CoPilotHub AI" + (f" (engine: {engine})" if engine else "") + "*"]
+    for n, s in enumerate(sections, 1):
+        parts.append(f"## {n}. {s['title']}\n\n{s['body']}")
+    return "\n\n".join(parts) + "\n"
+
+
+# ----------------------------------------------------------------------- generating
+def _store(session_id: uuid.UUID, inputs: ReportInputs, narrative: dict, warnings: list[str]) -> dict:
+    sections = assemble_sections(inputs, narrative, warnings + compliance_warnings(inputs.views, narrative))
+    title = f"Research report: {inputs.name}"[:200]
+    with db_session.SessionLocal() as db:
+        report = Report(
+            session_id=session_id, title=title, content=render_markdown(title, sections, inputs.engine),
+            format="markdown", origin="SYSTEM", status="FINAL", kind="FINAL", engine=inputs.engine, sections=sections,
+        )
+        db.add(report)
+        db.commit()
+        return {"report_id": str(report.id), "title": title, "chars": len(report.content), "kind": "FINAL"}
+
+
+def _collect_sync(session_id: uuid.UUID) -> ReportInputs:
+    with db_session.SessionLocal() as db:
+        existing = db.scalar(select(func.count()).select_from(Report).where(Report.session_id == session_id, Report.kind == "FINAL")) or 0
+        if existing >= get_settings().max_final_reports_per_session:
+            raise ReportLimitError(f"A session can hold at most {get_settings().max_final_reports_per_session} final reports")
+        return collect_inputs(db, session_id)
+
+
+async def generate_report(session_id: uuid.UUID, brain: Any) -> dict:
+    """Collect facts, ask the brain for the narrative, assemble, store. Returns a small summary."""
+    _generating.add(session_id)
+    try:
+        inputs = await asyncio.to_thread(_collect_sync, session_id)
+        warnings: list[str] = []
+        narrative: dict[str, str] = {}
+        try:
+            narrative = await asyncio.wait_for(
+                brain.write_report(inputs.task, inputs.history, ConstraintManager.prompt_lines(inputs.views), inputs.notes),
+                timeout=get_settings().agent_step_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Narrative generation failed: %s", exc, exc_info=True)
+            warnings.append(f"The narrative could not be generated ({exc.__class__.__name__}); the facts below were assembled from the collected data only.")
+        return await asyncio.to_thread(_store, session_id, inputs, narrative, warnings)
+    finally:
+        _generating.discard(session_id)
+
+================ FILE: backend\app\services\analytics_service.py ================
+"""Metrics, all computed from stored data. Nothing here is estimated or invented."""
+
+import logging
+import uuid
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.db import session as db_session
+from app.ml.collector import label_snapshots
+from app.ml.features import CORRECTIVE_TYPES, aware
+from app.models.agent import AgentAction, AgentState
+from app.models.analytics_record import AnalyticsRecord
+from app.models.approval import Approval
+from app.models.conflict import Conflict
+from app.models.document import Document
+from app.models.intervention import Intervention, InterventionType
+from app.models.risk_prediction import RiskPrediction
+from app.models.session import AgentSession, AgentStatus, SessionMember
+from app.models.source import Source
+from app.models.tool_execution import ToolExecution
+from app.models.user import User
+from app.schemas.analytics import (
+    AnalyticsOverview, ConfidencePoint, HistogramBucket, Research, ResearchGroup, RiskPoint,
+    RiskSummary, SessionAnalytics, SessionRow, ToolStat,
+)
+
+logger = logging.getLogger("copilothub.analytics")
+FINISHED = {AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.CANCELLED}
+
+
+def _ratio(a: float, b: float) -> float | None:
+    return a / b if b else None
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def compute(db: Session, session: AgentSession) -> tuple[SessionAnalytics, list[tuple[float, int]]]:
+    """Metrics for one session, plus (predicted probability, actual outcome) pairs."""
+    sid = session.id
+    now = datetime.now(timezone.utc)
+    duration = None
+    if session.started_at:
+        duration = ((aware(session.ended_at) if session.ended_at else now) - aware(session.started_at)).total_seconds()
+
+    evaluations = db.scalars(select(AgentAction).where(
+        AgentAction.session_id == sid, AgentAction.action_type == "EVALUATE", AgentAction.success.is_(True)
+    ).order_by(AgentAction.created_at)).all()
+    latest: dict[int, float] = {}
+    for e in evaluations:
+        value = (e.output_data or {}).get("confidence")
+        if isinstance(value, (int, float)):
+            latest[e.step_index] = float(value)
+    series = [ConfidencePoint(step_index=k, confidence=v) for k, v in sorted(latest.items())]
+    plan_row = db.scalar(select(AgentAction).where(
+        AgentAction.session_id == sid, AgentAction.action_type == "PLAN", AgentAction.success.is_(True)
+    ).order_by(AgentAction.created_at.desc()).limit(1))
+    failed_attempts = db.scalar(select(func.count()).select_from(AgentAction).where(
+        AgentAction.session_id == sid, AgentAction.success.is_(False))) or 0
+
+    by_type = Counter()
+    by_user = Counter()
+    corrective_values = {t.value for t in CORRECTIVE_TYPES}
+    corrective = 0
+    for iv_type, username in db.execute(
+        select(Intervention.type, User.username).join(User, User.id == Intervention.user_id, isouter=True)
+        .where(Intervention.session_id == sid)
+    ).all():
+        by_type[iv_type.value] += 1
+        if iv_type != InterventionType.COMMENT:
+            by_user[username or "unknown"] += 1
+        corrective += int(iv_type.value in corrective_values)
+    comments = by_type.get("COMMENT", 0)
+
+    tool_rows = db.execute(select(ToolExecution.tool_name, ToolExecution.status).where(ToolExecution.session_id == sid)).all()
+    per_tool: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for name, status in tool_rows:
+        per_tool[name][0] += 1
+        per_tool[name][1] += int(status != "SUCCESS")
+    tool_calls = len(tool_rows)
+    tool_failures = sum(v[1] for v in per_tool.values())
+
+    approvals = Counter(s.value for (s,) in db.execute(select(Approval.status).where(Approval.session_id == sid)).all())
+    conflicts = db.execute(select(Conflict.status).where(Conflict.session_id == sid)).all()
+    conflicts_open = sum(1 for (s,) in conflicts if s.value == "OPEN")
+
+    source_rows = db.execute(select(Source.status, Source.origin).where(Source.session_id == sid)).all()
+    used = sum(1 for s, _ in source_rows if s == "USED")
+    rejected = sum(1 for s, _ in source_rows if s == "REJECTED")
+    origins = Counter(o for s, o in source_rows if s == "USED")
+
+    predictions = db.scalars(select(RiskPrediction).where(RiskPrediction.session_id == sid).order_by(RiskPrediction.created_at)).all()
+    outcomes = {s.at: s.label for s in label_snapshots(db, session)} if predictions else {}
+    pairs = [(p.probability, outcomes[aware(p.snapshot_at)]) for p in predictions if aware(p.snapshot_at) in outcomes]
+    probs = [p.probability for p in predictions]
+    risk = RiskSummary(
+        data_source=predictions[-1].data_source if predictions else None, n=len(predictions),
+        mean=_mean(probs), max=max(probs) if probs else None, last=probs[-1] if probs else None,
+        history=[RiskPoint(step_index=p.step_index, probability=p.probability, level=p.level) for p in predictions],
+        observed_n=len(pairs),
+        mean_when_intervened=_mean([p for p, label in pairs if label == 1]),
+        mean_when_not=_mean([p for p, label in pairs if label == 0]),
+    )
+    state = db.scalar(select(AgentState).where(AgentState.session_id == sid))
+    approved, rejected_approvals = approvals.get("APPROVED", 0), approvals.get("REJECTED", 0)
+    analytics = SessionAnalytics(
+        session_id=sid, name=session.name, status=session.status.value, engine=state.engine if state else None,
+        created_at=session.created_at, duration_seconds=duration,
+        steps_planned=len((plan_row.output_data or {}).get("plan", [])) if plan_row else 0, steps_completed=len(latest),
+        confidence_series=series, avg_confidence=_mean(list(latest.values())),
+        final_confidence=series[-1].confidence if series else None, min_confidence=min(latest.values()) if latest else None,
+        interventions_total=sum(by_user.values()), comments=comments, corrective=corrective,
+        interventions_by_type=dict(by_type), interventions_by_user=dict(by_user),
+        tool_calls=tool_calls, tool_failures=tool_failures, tool_failure_rate=_ratio(tool_failures, tool_calls),
+        tools=[ToolStat(tool=k, calls=v[0], failures=v[1]) for k, v in sorted(per_tool.items())],
+        failed_attempts=failed_attempts, repeat_evaluations=len(evaluations) - len(latest),
+        recovered=failed_attempts > 0 and session.status == AgentStatus.COMPLETED,
+        approvals_requested=sum(approvals.values()), approvals_approved=approved,
+        approvals_rejected=rejected_approvals, approvals_expired=approvals.get("EXPIRED", 0),
+        approval_rate=_ratio(approved, approved + rejected_approvals),
+        conflicts_total=len(conflicts), conflicts_open=conflicts_open, conflicts_resolved=len(conflicts) - conflicts_open,
+        sources_used=used, sources_rejected=rejected, source_rejection_rate=_ratio(rejected, used + rejected),
+        sources_by_origin=dict(origins),
+        documents=db.scalar(select(func.count()).select_from(Document).where(Document.session_id == sid)) or 0,
+        risk=risk,
+    )
+    return analytics, pairs
+
+
+def _user_sessions(db: Session, user: User, limit: int = 200) -> list[AgentSession]:
+    return list(db.scalars(
+        select(AgentSession).join(SessionMember, SessionMember.session_id == AgentSession.id)
+        .where(SessionMember.user_id == user.id).order_by(AgentSession.created_at.desc()).limit(limit)
+    ).all())
+
+
+def overview(db: Session, user: User) -> AnalyticsOverview:
+    sessions = _user_sessions(db, user)
+    items = [compute(db, s) for s in sessions]
+    metrics = [m for m, _ in items]
+    status = Counter(m.status for m in metrics)
+    finished = [m for m in metrics if AgentStatus(m.status) in FINISHED]
+    completed = [m for m in metrics if m.status == "COMPLETED"]
+
+    by_type: Counter = Counter()
+    tools: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for m in metrics:
+        by_type.update(m.interventions_by_type)
+        for t in m.tools:
+            tools[t.tool][0] += t.calls
+            tools[t.tool][1] += t.failures
+    all_conf = [p.confidence for m in metrics for p in m.confidence_series]
+    buckets = [HistogramBucket(label=f"{i / 5:.1f}-{(i + 1) / 5:.1f}", count=0) for i in range(5)]
+    for c in all_conf:
+        buckets[min(4, int(c * 5))].count += 1
+
+    calls, failures = sum(m.tool_calls for m in metrics), sum(m.tool_failures for m in metrics)
+    approved, rejected_ap = sum(m.approvals_approved for m in metrics), sum(m.approvals_rejected for m in metrics)
+    used, rejected = sum(m.sources_used for m in metrics), sum(m.sources_rejected for m in metrics)
+    pairs = [p for _, ps in items for p in ps]
+    probs = [p.probability for m in metrics for p in m.risk.history]
+    sources_of_predictions = {m.risk.data_source for m in metrics if m.risk.data_source}
+    prediction = RiskSummary(
+        data_source="/".join(sorted(sources_of_predictions)) or None, n=len(probs), mean=_mean(probs),
+        max=max(probs) if probs else None, last=None, observed_n=len(pairs),
+        mean_when_intervened=_mean([p for p, label in pairs if label == 1]),
+        mean_when_not=_mean([p for p, label in pairs if label == 0]),
+    )
+
+    def group(label: str, members: list[SessionAnalytics]) -> ResearchGroup:
+        return ResearchGroup(
+            label=label, sessions=len(members),
+            completion_rate=_ratio(sum(m.status == "COMPLETED" for m in members), len(members)),
+            avg_duration_seconds=_mean([m.duration_seconds for m in members if m.duration_seconds is not None]),
+            avg_final_confidence=_mean([m.final_confidence for m in members if m.final_confidence is not None]),
+        )
+
+    with_corrections = [m for m in finished if m.corrective > 0]
+    without = [m for m in finished if m.corrective == 0]
+    steps = sum(m.steps_completed for m in metrics)
+    had_trouble = [m for m in finished if m.failed_attempts > 0]
+    research = Research(
+        task_completion_rate=_ratio(len(completed), len(finished)),
+        human_correction_rate=_ratio(sum(m.corrective for m in metrics), steps),
+        incorrect_actions_per_session=_ratio(sum(m.corrective + m.approvals_rejected for m in finished), len(finished)),
+        agent_recovery_rate=_ratio(sum(m.recovered for m in had_trouble), len(had_trouble)),
+        avg_time_to_completion_seconds=_mean([m.duration_seconds for m in completed if m.duration_seconds is not None]),
+        source_rejection_rate=_ratio(rejected, used + rejected), tool_failure_rate=_ratio(failures, calls),
+        conflicts_per_session=_ratio(sum(m.conflicts_total for m in metrics), len(metrics)),
+        groups=[group("Sessions with at least one corrective intervention", with_corrections),
+                group("Sessions without corrective interventions", without)],
+        notes=("Observational numbers from your own sessions, usually with small samples. The two groups are NOT a "
+               "controlled experiment (people choose when to intervene), so differences must not be read as proof "
+               "that interventions help or hurt."),
+    )
+
+    return AnalyticsOverview(
+        generated_at=datetime.now(timezone.utc), sessions_total=len(metrics),
+        sessions_completed=status.get("COMPLETED", 0), sessions_failed=status.get("FAILED", 0),
+        sessions_cancelled=status.get("CANCELLED", 0),
+        sessions_active=len(metrics) - len(finished) - 0,
+        success_rate=_ratio(len(completed), len(finished)),
+        avg_duration_seconds=_mean([m.duration_seconds for m in finished if m.duration_seconds is not None]),
+        interventions_total=sum(m.interventions_total for m in metrics),
+        interventions_corrective=sum(m.corrective for m in metrics),
+        interventions_per_session=_ratio(sum(m.interventions_total for m in metrics), len(metrics)),
+        interventions_by_type=dict(by_type), avg_confidence=_mean(all_conf),
+        avg_final_confidence=_mean([m.final_confidence for m in metrics if m.final_confidence is not None]),
+        confidence_histogram=buckets, tool_calls=calls, tool_failures=failures, tool_failure_rate=_ratio(failures, calls),
+        tools=[ToolStat(tool=k, calls=v[0], failures=v[1]) for k, v in sorted(tools.items())],
+        approvals_requested=sum(m.approvals_requested for m in metrics), approvals_approved=approved,
+        approvals_rejected=rejected_ap, approval_rate=_ratio(approved, approved + rejected_ap),
+        conflicts_total=sum(m.conflicts_total for m in metrics), conflicts_open=sum(m.conflicts_open for m in metrics),
+        sources_used=used, sources_rejected=rejected, source_rejection_rate=_ratio(rejected, used + rejected),
+        prediction=prediction, research=research,
+        recent_sessions=[
+            SessionRow(id=m.session_id, name=m.name, status=m.status, created_at=m.created_at,
+                       duration_seconds=m.duration_seconds, interventions=m.interventions_total, corrective=m.corrective,
+                       tool_failures=m.tool_failures, conflicts=m.conflicts_total, final_confidence=m.final_confidence)
+            for m in metrics[:20]
+        ],
+    )
+
+
+# ---------------------------------------------------------------- durable snapshot for research export
+def record_session_end(session_id: uuid.UUID) -> None:
+    """Upsert the AnalyticsRecord of a session (idempotent). Called when a session ends."""
+    with db_session.SessionLocal() as db:
+        session = db.get(AgentSession, session_id)
+        if session is None:
+            return
+        m, _ = compute(db, session)
+        record = db.scalar(select(AnalyticsRecord).where(AnalyticsRecord.session_id == session_id))
+        if record is None:
+            record = AnalyticsRecord(session_id=session_id)
+            db.add(record)
+        record.status = m.status
+        record.duration_seconds = m.duration_seconds
+        record.steps_completed = m.steps_completed
+        record.interventions = m.interventions_total
+        record.corrective = m.corrective
+        record.tool_calls = m.tool_calls
+        record.tool_failures = m.tool_failures
+        record.conflicts = m.conflicts_total
+        record.approvals_requested = m.approvals_requested
+        record.approvals_approved = m.approvals_approved
+        record.sources_used = m.sources_used
+        record.sources_rejected = m.sources_rejected
+        record.final_confidence = m.final_confidence
+        record.avg_confidence = m.avg_confidence
+        record.metrics = m.model_dump(mode="json")
+        db.commit()
+
+
+CSV_COLUMNS = [
+    "session_id", "status", "duration_seconds", "steps_completed", "interventions", "corrective", "tool_calls",
+    "tool_failures", "conflicts", "approvals_requested", "approvals_approved", "sources_used", "sources_rejected",
+    "final_confidence", "avg_confidence", "recorded_at",
+]
+
+
+def export_rows(db: Session, user: User) -> list[dict]:
+    rows = db.scalars(
+        select(AnalyticsRecord).join(SessionMember, SessionMember.session_id == AnalyticsRecord.session_id)
+        .where(SessionMember.user_id == user.id).order_by(AnalyticsRecord.created_at)
+    ).all()
+    return [
+        {**{c: getattr(r, c) for c in CSV_COLUMNS if c not in ("session_id", "recorded_at")},
+         "session_id": str(r.session_id), "recorded_at": r.updated_at.isoformat()}
+        for r in rows
+    ]
+
+================ FILE: backend\app\core\security.py ================
+from datetime import datetime, timedelta, timezone
+
+import bcrypt
+import jwt
+
+from app.core.config import get_settings
+
+settings = get_settings()
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except ValueError:
+        return False
+
+
+# Used to keep login timing similar whether or not the email exists.
+DUMMY_HASH = hash_password("not-a-real-password")
+
+
+def create_access_token(subject: str) -> tuple[str, int]:
+    """Return (token, expires_in_seconds). The role is NOT stored in the token:
+    permissions are always read from the database on each request."""
+    expires_delta = timedelta(minutes=settings.access_token_expire_minutes)
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": subject,
+        "type": "access",
+        "iat": now,
+        "exp": now + expires_delta,
+    }
+    token = jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
+    return token, int(expires_delta.total_seconds())
+
+
+def decode_access_token(token: str) -> dict:
+    """Raises jwt.InvalidTokenError (incl. expiry) on any problem."""
+    payload = jwt.decode(
+        token,
+        settings.secret_key,
+        algorithms=[settings.jwt_algorithm],
+        options={"require": ["exp", "sub"]},
+    )
+    if payload.get("type") != "access":
+        raise jwt.InvalidTokenError("Wrong token type")
+    return payload
+
+================ FILE: backend\app\core\config.py ================
+
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# ============================================================
+# Application Version (Phase 15)
+# ============================================================
+
+APP_VERSION = "1.0.0"
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # ---- Application ----
+    app_name: str = "CoPilotHub AI"
+    environment: str = "development"
+    debug: bool = False
+    demo_mode: bool = True
+
+    # ---- Database and Authentication ----
+    database_url: str
+    secret_key: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+
+    # ---- CORS ----
+    cors_origins: str = "http://localhost:5173"
+
+    # ---- LLM (Phase 6) ----
+    llm_provider: str = "ollama"
+    # "ollama" | "openai_compatible"
+
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen3"
+
+    # OPTIONAL - any OpenAI-compatible endpoint
+    optional_api_base_url: str = ""
+    optional_api_key: str = ""
+    optional_api_model: str = ""
+
+    llm_timeout_seconds: float = 120.0
+    llm_temperature: float = 0.2
+
+    # ---- Agent (Phase 5) ----
+    agent_max_steps: int = Field(default=8, ge=1, le=30)
+    agent_max_retries: int = Field(default=2, ge=0, le=5)
+    agent_retry_backoff_seconds: float = 1.0
+    agent_step_delay_seconds: float = 1.5
+    agent_step_timeout_seconds: float = 180.0
+    agent_max_runtime_seconds: float = 900.0
+    agent_require_final_approval: bool = True
+    agent_max_approval_rounds: int = Field(
+        default=3, ge=1, le=10
+    )
+    agent_max_replans: int = Field(
+        default=3, ge=0, le=10
+    )
+
+    # ---- RAG (Phase 10) ----
+    data_dir: str = "../data"
+
+    # "hashing" works without downloading Sentence-Transformers.
+    # Docker Compose currently overrides this setting to "hashing".
+    embedding_backend: str = "sentence_transformers"
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    rag_chunk_size: int = Field(default=900, ge=100, le=4000)
+    rag_chunk_overlap: int = Field(default=120, ge=0, le=1000)
+    rag_top_k: int = Field(default=4, ge=1, le=20)
+    rag_min_score: float = 0.15
+    max_upload_mb: int = Field(default=10, ge=1, le=100)
+    max_documents_per_session: int = Field(
+        default=20, ge=1, le=200
+    )
+    rag_max_chunks_per_document: int = Field(
+        default=400, ge=1, le=5000
+    )
+
+    # ---- Tools (Phase 11) ----
+    agent_tools_enabled: bool = True
+    # False = use Phase 10 single-shot agent steps
+
+    agent_enabled_tools: str = ""
+    # Comma-separated allow-list; empty = all built-in tools
+
+    agent_max_tool_calls_per_step: int = Field(
+        default=3, ge=1, le=8
+    )
+    agent_max_tool_calls_per_run: int = Field(
+        default=40, ge=1, le=500
+    )
+
+    tool_timeout_seconds: float = 30.0
+
+    tool_output_max_chars: int = Field(
+        default=4000, ge=200, le=20000
+    )
+
+    max_reports_per_session: int = Field(
+        default=5, ge=1, le=50
+    )
+
+    # "demo" = simulated offline results
+    # "searxng" and "duckduckgo" are optional live providers
+    web_search_provider: str = "demo"
+    searxng_url: str = ""
+
+    # ---- NLP Intervention Classifier (Phase 12) ----
+    nlp_auto_apply: bool = True
+    # False = always ask for user confirmation
+
+    nlp_auto_train: bool = True
+    # Train on first use when no saved model exists
+
+    # ---- ML Intervention-Risk Predictor (Phase 13) ----
+    risk_prediction_enabled: bool = True
+
+    risk_auto_train: bool = False
+    # False = train explicitly using python -m app.ml.train.
+    # Synthetic training data does not establish real-world accuracy.
+
+    risk_synthetic_rows: int = Field(
+        default=3000, ge=500, le=50000
+    )
+
+    # ---- Final Reports (Phase 14) ----
+    agent_generate_final_report: bool = True
+
+    max_final_reports_per_session: int = Field(
+        default=5, ge=1, le=50
+    )
+
+    # ============================================================
+    # Phase 15: Security and Maintenance
+    # ============================================================
+
+    rate_limit_enabled: bool = True
+    # Enable rate limiting on authentication and sensitive endpoints.
+
+    cleanup_orphans_on_start: bool = False
+    # If enabled, remove uploaded files and indexes belonging
+    # to sessions that no longer exist in the database.
+
+    # ============================================================
+    # Field Validators
+    # ============================================================
+
+    @field_validator("embedding_backend")
+    @classmethod
+    def embedding_backend_must_be_known(cls, value: str) -> str:
+        value = value.strip().lower()
+
+        if value not in {"sentence_transformers", "hashing"}:
+            raise ValueError(
+                "EMBEDDING_BACKEND must be "
+                "'sentence_transformers' or 'hashing'"
+            )
+
+        return value
+
+    @field_validator("web_search_provider")
+    @classmethod
+    def web_search_provider_must_be_known(cls, value: str) -> str:
+        value = value.strip().lower()
+
+        if value not in {"demo", "searxng", "duckduckgo"}:
+            raise ValueError(
+                "WEB_SEARCH_PROVIDER must be "
+                "'demo', 'searxng' or 'duckduckgo'"
+            )
+
+        return value
+
+    @field_validator("secret_key")
+    @classmethod
+    def secret_key_must_be_long(cls, value: str) -> str:
+        if len(value) < 32:
+            raise ValueError(
+                "SECRET_KEY must be at least 32 characters long"
+            )
+
+        return value
+
+    @field_validator("llm_provider")
+    @classmethod
+    def llm_provider_must_be_known(cls, value: str) -> str:
+        value = value.strip().lower()
+
+        if value not in {"ollama", "openai_compatible"}:
+            raise ValueError(
+                "LLM_PROVIDER must be 'ollama' or 'openai_compatible'"
+            )
+
+        return value
+
+    # ============================================================
+    # Phase 15: Production Security Validator
+    # ============================================================
+
+    @model_validator(mode="after")
+    def production_needs_a_real_secret(self):
+        """
+        Prevent the application from starting in production
+        when a known placeholder SECRET_KEY is configured.
+        """
+        if self.environment.strip().lower() == "production":
+            lowered = self.secret_key.lower()
+
+            if (
+                "replace_with" in lowered
+                or "change_me" in lowered
+            ):
+                raise ValueError(
+                    "Set a real SECRET_KEY before running "
+                    "with ENVIRONMENT=production"
+                )
+
+        return self
+
+    # ============================================================
+    # Properties
+    # ============================================================
+
+    @property
+    def data_path(self) -> Path:
+        return Path(self.data_dir).expanduser().resolve()
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.cors_origins.split(",")
+            if origin.strip()
+        ]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+

@@ -55,13 +55,7 @@ export default function RiskCard({ risk, history }: { risk: RiskEstimate | null;
             </ul>
           )}
 
-          <p className="mt-3 text-[11px] text-slate-400">Model: {risk.model?.replace(/_/g, " ")}</p>
-          {risk.warning && (
-            <p className="mt-2 rounded-lg bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
-              {risk.data_source === "synthetic" ? "Trained on SYNTHETIC data: " : ""}
-              this is an illustration of the method, not a proven prediction.
-            </p>
-          )}
+          
         </>
       )}
     </div>

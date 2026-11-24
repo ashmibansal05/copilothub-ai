@@ -163,6 +163,10 @@ class AgentOrchestrator:
         """Entry point used by the runner. Never raises except on cancellation."""
         try:
             task = self._load_task()
+            from app.services.coding_agent import classify_task
+            if classify_task(task) == "HYBRID":
+                from app.services.project_profile import research_brief
+                task = research_brief(task)
             self.brain, notice = await self.brain_factory()
             await self._save_state(
                 engine=self.brain.engine, current_step="Starting", step_index=0,
@@ -198,6 +202,12 @@ class AgentOrchestrator:
         replanning = bool(state.get("plan"))
         self._replan_requested = False  # a fresh plan reflects the latest task
         task = self._load_task() if replanning else state["task"]
+        from app.services.coding_agent import classify_task
+        if replanning and classify_task(task) == "HYBRID":
+            from app.services.project_profile import research_brief
+            task = research_brief(task)
+        hybrid_phase = classify_task(self._load_task()) == "HYBRID"
+        max_steps = min(self.settings.agent_max_steps, 3) if hybrid_phase else self.settings.agent_max_steps
         ctx = await self._human_context(task)
 
         await self._set_status(AgentStatus.PLANNING, {AgentStatus.RUNNING})
@@ -209,9 +219,9 @@ class AgentOrchestrator:
         started = time.monotonic()
         plan = await self._attempt(
             "PLAN",
-            lambda: self.brain.make_plan(task, ctx.constraints, self.settings.agent_max_steps, notes=ctx.notes),
+            lambda: self.brain.make_plan(task, ctx.constraints, max_steps, notes=ctx.notes),
         )
-        plan = plan[: self.settings.agent_max_steps]
+        plan = plan[:max_steps]
         await self._record_action(0, "PLAN", None, {}, {"plan": plan}, True, None, self._ms(started))
         await self._save_state(
             plan=plan, total_steps=len(plan), step_index=0,
@@ -265,6 +275,11 @@ class AgentOrchestrator:
         Bounded by max calls per step and per run."""
         assert self.brain is not None
         specs = self.tools.specs()
+        from app.services.coding_agent import classify_task
+        if classify_task(self._load_task()) == "HYBRID":
+            # A comparison task should not spam the numeric calculator with
+            # symbolic variables. Calculation is only useful with actual values.
+            specs = [spec for spec in specs if spec.name != "calculate"]
         observations: list[ToolObservation] = []
         used: list[str] = []
         sources: list[dict] = []
@@ -635,12 +650,21 @@ class AgentOrchestrator:
         )
         await self._generate_final_report()
         if await self._set_status(AgentStatus.COMPLETED, FINISHABLE):
-            await self._emit(EventType.COMPLETED, {
-                "summary": final.get("summary", ""),
-                "confidence": final.get("confidence"),
-                "incomplete_plan": incomplete,
-                "skipped_steps": skipped,
-            })
+            from app.services.coding_agent import classify_task
+            if classify_task(self._load_task()) == "HYBRID":
+                # This is only the research milestone. Do not claim the entire
+                # project is finished before code generation and owner review.
+                await self._emit(EventType.STEP_COMPLETED, {
+                    "step": "Research phase finished", "incomplete_plan": incomplete,
+                    "skipped_steps": skipped,
+                })
+            else:
+                await self._emit(EventType.COMPLETED, {
+                    "summary": final.get("summary", ""),
+                    "confidence": final.get("confidence"),
+                    "incomplete_plan": incomplete,
+                    "skipped_steps": skipped,
+                })
         await self._record_analytics()
 
     async def _fail(self, error: str) -> None:
@@ -677,7 +701,9 @@ class AgentOrchestrator:
             return
         await self._emit(EventType.AGENT_MESSAGE, {"kind": "system", "text": "Generating the final report..."})
         try:
-            info = await report_service.generate_report(self.session_id, self.brain, approved_final=True)
+            from app.services.coding_agent import classify_task
+            is_hybrid = classify_task(self._load_task()) == "HYBRID"
+            info = await report_service.generate_report(self.session_id, self.brain, approved_final=not is_hybrid)
             await self._emit(EventType.REPORT_SAVED, {"report": info})
         except asyncio.CancelledError:
             raise

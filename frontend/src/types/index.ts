@@ -343,7 +343,20 @@ export interface RiskSummary {
   mean_when_not: number | null;
 }
 
+export interface ProjectMetrics {
+  files: number;
+  versions_saved: number;
+  syntax_validated: number;
+  validation_failed: number;
+  not_validated: number;
+  code_reviews: number;
+  revisions_requested: number;
+  approval_status: string;
+  runtime_tested: boolean;
+}
+
 export interface SessionAnalytics {
+  project_metrics?: ProjectMetrics | null;
   session_id: string;
   name: string;
   status: string;

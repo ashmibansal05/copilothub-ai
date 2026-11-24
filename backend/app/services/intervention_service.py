@@ -112,6 +112,9 @@ async def process_intervention(db: Session, ctx: SessionContext, data: Intervent
         pending = approval_service.get_pending(db, sid)
         if pending is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "Nothing is waiting for approval")
+        if (pending.payload or {}).get("review_type") == "CODE":
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                "Approve or request code changes in the Source Code review panel")
         decision = ApprovalDecision(approved=(t == T.APPROVE), note=content, by=user.username)
         if not agent_runner.resolve_approval(sid, pending.id, decision):
             approval_service.expire_pending(db, sid)

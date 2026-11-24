@@ -18,6 +18,9 @@ from app.schemas.auth import MessageResponse
 from app.schemas.tools import ReportDetail, ReportSummary
 from app.services import event_service, report_service
 from app.services.report_export import EXPORTERS, safe_filename
+from app.services.code_service import source_section
+from app.services.report_service import render_markdown
+from types import SimpleNamespace
 from app.websocket.events import EventType
 
 logger = logging.getLogger("copilothub.report")
@@ -33,8 +36,22 @@ def _summary(r: Report) -> ReportSummary:
     )
 
 
-def _detail(r: Report) -> ReportDetail:
-    return ReportDetail(**_summary(r).model_dump(), content=r.content, sections=r.sections)
+def _with_code(r: Report, db: Session):
+    """Attach current code to the response without changing the approved report stored in DB."""
+    sections = list(r.sections or [])
+    # Approved coding reports are immutable snapshots; later edits must not change them.
+    if r.kind == "FINAL" and any(x.get("key") == "source_code" for x in sections):
+        return SimpleNamespace(title=r.title, engine=r.engine, content=r.content, sections=sections)
+    addition = source_section(db, r.session_id)
+    if addition:
+        sections = [s for s in sections if s.get("key") != "source_code"] + [addition]
+    content = render_markdown(r.title, sections, r.engine) if addition else r.content
+    return SimpleNamespace(title=r.title, engine=r.engine, content=content, sections=sections)
+
+
+def _detail(r: Report, db: Session) -> ReportDetail:
+    snap = _with_code(r, db)
+    return ReportDetail(**_summary(r).model_dump(), content=snap.content, sections=snap.sections)
 
 
 def _get(db: Session, ctx: SessionContext, report_id: uuid.UUID) -> Report:
@@ -63,7 +80,7 @@ async def get_final_report(
     )
     if report is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No final report has been generated yet")
-    return _detail(report)
+    return _detail(report, db)
 
 
 async def _generate_in_background(session_id: uuid.UUID) -> None:
@@ -87,6 +104,9 @@ async def generate_report(
 ) -> MessageResponse:
     """Build a draft research snapshot without bypassing the final approval gate."""
     sid = ctx.session.id
+    from app.services.coding_agent import classify_task
+    if classify_task(ctx.session.task) == "CODING":
+        raise HTTPException(409, "Review and approve code in Source Code before finalizing a project report")
     done = db.scalar(select(func.count()).select_from(AgentAction).where(
         AgentAction.session_id == sid, AgentAction.action_type == "EVALUATE", AgentAction.success.is_(True))) or 0
     if done == 0:
@@ -107,7 +127,7 @@ async def generate_report(
 async def get_report(
     report_id: uuid.UUID, ctx: SessionContext = Depends(get_session_context), db: Session = Depends(get_db)
 ) -> ReportDetail:
-    return _detail(_get(db, ctx, report_id))
+    return _detail(_get(db, ctx, report_id), db)
 
 
 @router.get("/{session_id}/reports/{report_id}/download")
@@ -120,7 +140,7 @@ async def download_report(
     report = _get(db, ctx, report_id)
     media_type, render = EXPORTERS[format]
     return Response(
-        content=render(report), media_type=media_type,
+        content=render(_with_code(report, db)), media_type=media_type,
         headers={
             "Content-Disposition": f'attachment; filename="{safe_filename(report.title)}.{format}"',
             "X-Content-Type-Options": "nosniff",

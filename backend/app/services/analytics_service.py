@@ -12,6 +12,8 @@ from app.db import session as db_session
 from app.ml.collector import label_snapshots
 from app.ml.features import CORRECTIVE_TYPES, aware
 from app.models.agent import AgentAction, AgentState
+from app.models.code_artifact import CodeArtifact, CodeArtifactVersion
+from app.models.approval import ApprovalKind
 from app.models.analytics_record import AnalyticsRecord
 from app.models.approval import Approval
 from app.models.conflict import Conflict
@@ -24,7 +26,7 @@ from app.models.tool_execution import ToolExecution
 from app.models.user import User
 from app.schemas.analytics import (
     AnalyticsOverview, ConfidencePoint, HistogramBucket, Research, ResearchGroup, RiskPoint,
-    RiskSummary, SessionAnalytics, SessionRow, ToolStat,
+    RiskSummary, SessionAnalytics, SessionRow, ToolStat, ProjectMetrics,
 )
 
 logger = logging.getLogger("copilothub.analytics")
@@ -107,6 +109,32 @@ def compute(db: Session, session: AgentSession) -> tuple[SessionAnalytics, list[
     )
     state = db.scalar(select(AgentState).where(AgentState.session_id == sid))
     approved, rejected_approvals = approvals.get("APPROVED", 0), approvals.get("REJECTED", 0)
+    artifact_rows = db.scalars(select(CodeArtifact).where(CodeArtifact.session_id == sid)).all()
+    project_metrics = None
+    if artifact_rows:
+        statuses = Counter(a.validation_status for a in artifact_rows)
+        artifact_ids = [a.id for a in artifact_rows]
+        all_versions = db.scalar(select(func.count()).select_from(CodeArtifactVersion).where(
+            CodeArtifactVersion.artifact_id.in_(artifact_ids))) or 0
+        review_rows = db.scalars(select(Approval).where(Approval.session_id == sid,
+            Approval.kind == ApprovalKind.REVIEW).order_by(Approval.created_at)).all()
+        code_reviews = [a for a in review_rows if (a.payload or {}).get("review_type") == "CODE"]
+        recent = code_reviews[-1] if code_reviews else None
+        approval_status = recent.status.value if recent else "NONE"
+        if recent and approval_status == "APPROVED":
+            current = {a.path: a.current_version for a in artifact_rows}
+            if current != (recent.payload or {}).get("versions", {}):
+                approval_status = "OUTDATED"
+        project_metrics = ProjectMetrics(
+            files=len(artifact_rows), versions_saved=all_versions,
+            syntax_validated=statuses.get("SYNTAX_VALIDATED", 0),
+            validation_failed=statuses.get("VALIDATION_FAILED", 0),
+            not_validated=statuses.get("NOT_VALIDATED", 0),
+            code_reviews=len(code_reviews),
+            revisions_requested=sum(a.status.value == "REJECTED" for a in code_reviews),
+            approval_status=approval_status,
+            runtime_tested=False,
+        )
     analytics = SessionAnalytics(
         session_id=sid, name=session.name, status=session.status.value, engine=state.engine if state else None,
         created_at=session.created_at, duration_seconds=duration,
@@ -126,7 +154,7 @@ def compute(db: Session, session: AgentSession) -> tuple[SessionAnalytics, list[
         sources_used=used, sources_rejected=rejected, source_rejection_rate=_ratio(rejected, used + rejected),
         sources_by_origin=dict(origins),
         documents=db.scalar(select(func.count()).select_from(Document).where(Document.session_id == sid)) or 0,
-        risk=risk,
+        risk=risk, project_metrics=project_metrics,
     )
     return analytics, pairs
 

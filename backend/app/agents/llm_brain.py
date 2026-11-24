@@ -194,75 +194,72 @@ class LLMBrain(AgentBrain):
             force_final,
         )
 
-        raw = await self.provider.generate(
-            messages,
-            json_mode=True,
-            max_tokens=500,
-        )
+        def interpret(raw: str) -> AgentAction:
+            try:
+                data = extract_json(raw)
+            except LLMResponseError:
+                # A genuinely plain-text answer can be used as findings, but
+                # malformed JSON and partial tool calls must be repaired.
+                text = raw.strip()
+                if len(text) >= 30 and not text.startswith(("{", "[", "```")):
+                    return FinalAnswer(text[:1500])
+                raise
 
+            if not isinstance(data, dict):
+                raise LLMResponseError("The reply is not a JSON object")
+
+            action_value = data.get("action")
+            action = action_value.strip().lower() if isinstance(action_value, str) else ""
+            if action == "final":
+                findings = data.get("findings") or data.get("answer") or data.get("final")
+                if not isinstance(findings, str) or not findings.strip():
+                    raise LLMResponseError("The final reply has no findings")
+                return FinalAnswer(findings.strip()[:1500])
+
+            if action == "tool":
+                if force_final:
+                    raise LLMResponseError("The model called a tool although it had to answer now")
+                tool = data.get("tool")
+                arguments = data.get("arguments", {})
+                if not isinstance(tool, str) or not tool.strip():
+                    raise LLMResponseError("The tool call has no tool name")
+                if not isinstance(arguments, dict):
+                    raise LLMResponseError("The tool arguments must be a JSON object")
+                return ToolCall(tool=tool.strip(), arguments=arguments)
+
+            # A missing discriminator with clear findings can be interpreted
+            # safely. Never guess tool calls, fabricate evidence, or accept an
+            # unknown action label as a final answer.
+            if not action:
+                for key in ("findings", "answer", "final", "response", "content", "text"):
+                    candidate = data.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        return FinalAnswer(candidate.strip()[:1500])
+            raise LLMResponseError("The reply has no valid 'action'")
+
+        raw = await self.provider.generate(messages, json_mode=True, max_tokens=500)
         try:
-            data = extract_json(raw)
-
-        except LLMResponseError:
-            # Small models sometimes respond in plain text.
-            # Accept a sufficiently long prose response as final findings,
-            # but never treat incomplete JSON as a final answer.
-            text = raw.strip()
-
-            if len(text) >= 30 and not text.startswith(("{", "[")):
-                return FinalAnswer(text[:1500])
-
-            raise
-
-        if not isinstance(data, dict):
-            raise LLMResponseError(
-                "The reply is not a JSON object"
+            return interpret(raw)
+        except LLMResponseError as first_error:
+            # Small local models frequently ignore the action discriminator.
+            # Give ONE targeted correction, using the same original constraints
+            # and observations. The orchestrator still validates tool calls.
+            correction = (
+                "Your previous reply was invalid: " + str(first_error) + ". "
+                "Reply with one valid JSON object ONLY. Choose EXACTLY one shape: "
+                '{"action":"final","findings":"Grounded findings for this step"} '
+                "or "
+                '{"action":"tool","tool":"an available tool name","arguments":{}}. '
+                "Do not invent evidence or a tool name. If a tool failed, use "
+                "the observations and explain limitations. "
+                + ('You MUST use action=final; do not request tools.' if force_final else '')
             )
-
-        action = str(data.get("action", "")).lower()
-
-        if action == "final":
-            text = (
-                data.get("findings")
-                or data.get("answer")
-                or data.get("final")
+            repair_messages = [*messages, {"role": "assistant", "content": raw[:1500]},
+                               {"role": "user", "content": correction}]
+            repaired = await self.provider.generate(
+                repair_messages, json_mode=True, max_tokens=350, temperature=0.0
             )
-
-            if not isinstance(text, str) or not text.strip():
-                raise LLMResponseError(
-                    "The final reply has no findings"
-                )
-
-            return FinalAnswer(
-                text.strip()[:1500]
-            )
-
-        if action == "tool":
-            if force_final:
-                raise LLMResponseError(
-                    "The model called a tool although it had to answer now"
-                )
-
-            tool = data.get("tool")
-            arguments = data.get("arguments", {})
-
-            if not isinstance(tool, str) or not tool:
-                raise LLMResponseError(
-                    "The tool call has no tool name"
-                )
-
-            return ToolCall(
-                tool=tool,
-                arguments=(
-                    arguments
-                    if isinstance(arguments, dict)
-                    else {}
-                ),
-            )
-
-        raise LLMResponseError(
-            "The reply has no valid 'action'"
-        )
+            return interpret(repaired)
 
     async def evaluate(
         self,

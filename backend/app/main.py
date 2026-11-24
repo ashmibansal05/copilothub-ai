@@ -25,6 +25,10 @@ async def lifespan(_: FastAPI):
         settings.llm_provider, settings.embedding_backend,
     )
     try:
+        from app.services.workflow_service import recover_interrupted_requests
+        recovered_requests = recover_interrupted_requests()
+        if recovered_requests:
+            logger.warning("Recovered %d queued collaborator instruction(s)", recovered_requests)
         await recover_orphaned_sessions()
     except Exception:
         logger.exception("Could not check for interrupted sessions (is the database migrated?)")
@@ -59,7 +63,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 

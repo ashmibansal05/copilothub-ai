@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 from app.api import (
     agent, analytics, auth, conflicts, documents, health, instructions, interventions,
-    reports, risk, session_control, sessions, tools, system,
+    reports, risk, session_control, sessions, tools, system, code, code,
 )
 
 api_router = APIRouter()
@@ -15,6 +15,8 @@ api_router.include_router(conflicts.router)
 api_router.include_router(documents.router)
 api_router.include_router(tools.router)
 api_router.include_router(reports.router)
+api_router.include_router(code.router)
+api_router.include_router(code.router)
 api_router.include_router(instructions.router)
 api_router.include_router(risk.router)
 api_router.include_router(analytics.router)

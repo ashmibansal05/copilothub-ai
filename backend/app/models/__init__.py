@@ -20,3 +20,10 @@ from app.models.report import Report  # noqa: F401
 from app.models.tool_execution import ToolExecution  # noqa: F401
 from app.models.analytics_record import AnalyticsRecord  # noqa: F401
 from app.models.risk_prediction import RiskPrediction  # noqa: F401
+from app.models.code_artifact import CodeArtifact, CodeArtifactVersion  # noqa: F401
+
+from app.models.code_artifact import CodeArtifact, CodeArtifactVersion  # noqa: F401
+
+from app.models.code_artifact import CodeArtifact, CodeArtifactVersion  # noqa: F401
+
+from app.models.workflow_request import WorkflowRequest  # noqa: F401
